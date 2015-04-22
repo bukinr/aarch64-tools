@@ -1,0 +1,1011 @@
+diff --git a/sys/arm/arm/generic_timer.c b/sys/arm/arm/generic_timer.c
+index d246a87..5898258 100644
+--- a/sys/arm/arm/generic_timer.c
++++ b/sys/arm/arm/generic_timer.c
+@@ -85,8 +85,8 @@ static struct arm_tmr_softc *arm_tmr_sc = NULL;
+ static struct resource_spec timer_spec[] = {
+ 	{ SYS_RES_IRQ,		0,	RF_ACTIVE },	/* Secure */
+ 	{ SYS_RES_IRQ,		1,	RF_ACTIVE },	/* Non-secure */
+-	{ SYS_RES_IRQ,		2,	RF_ACTIVE },	/* Virt */
+-	{ SYS_RES_IRQ,		3,	RF_ACTIVE | RF_OPTIONAL	}, /* Hyp */
++	{ SYS_RES_IRQ,		2,	RF_ACTIVE | RF_OPTIONAL},	/* Virt */
++	{ SYS_RES_IRQ,		3,	RF_ACTIVE | RF_OPTIONAL},	/* Hyp */
+ 	{ -1, 0 }
+ };
+ 
+@@ -291,6 +291,8 @@ arm_tmr_attach(device_t dev)
+ 		sc->clkfreq = get_freq();
+ 	}
+ 
++	sc->clkfreq = 10000000; /* 10 MHz */
++
+ 	if (sc->clkfreq == 0) {
+ 		device_printf(dev, "No clock frequency specified\n");
+ 		return (ENXIO);
+@@ -307,10 +309,12 @@ arm_tmr_attach(device_t dev)
+ 	sc->physical = false;
+ #endif
+ 
++	sc->physical = true;
++
+ 	arm_tmr_sc = sc;
+ 
+ 	/* Setup secure, non-secure and virtual IRQs handler */
+-	for (i = 0; i < 3; i++) {
++	for (i = 0; i < 2; i++) {
+ 		error = bus_setup_intr(dev, sc->res[i], INTR_TYPE_CLK,
+ 		    arm_tmr_intr, NULL, sc, &sc->ihl[i]);
+ 		if (error) {
+diff --git a/sys/arm64/arm64/bus_machdep.c b/sys/arm64/arm64/bus_machdep.c
+index d8e6646..25a675e 100644
+--- a/sys/arm64/arm64/bus_machdep.c
++++ b/sys/arm64/arm64/bus_machdep.c
+@@ -169,10 +169,10 @@ struct bus_space memmap_bus = {
+ 	.bs_r_8_s = NULL,
+ 
+ 	/* read multiple stream */
+-	.bs_rm_1_s = NULL,
+-	.bs_rm_2_s = NULL,
+-	.bs_rm_4_s = NULL,
+-	.bs_rm_8_s = NULL,
++	.bs_rm_1_s = generic_bs_rm_1,
++	.bs_rm_2_s = generic_bs_rm_2,
++	.bs_rm_4_s = generic_bs_rm_4,
++	.bs_rm_8_s = generic_bs_rm_8,
+ 
+ 	/* read region stream */
+ 	.bs_rr_1_s = NULL,
+@@ -187,10 +187,10 @@ struct bus_space memmap_bus = {
+ 	.bs_w_8_s = NULL,
+ 
+ 	/* write multiple stream */
+-	.bs_wm_1_s = NULL,
+-	.bs_wm_2_s = NULL,
+-	.bs_wm_4_s = NULL,
+-	.bs_wm_8_s = NULL,
++	.bs_wm_1_s = generic_bs_wm_1,
++	.bs_wm_2_s = generic_bs_wm_2,
++	.bs_wm_4_s = generic_bs_wm_4,
++	.bs_wm_8_s = generic_bs_wm_8,
+ 
+ 	/* write region stream */
+ 	.bs_wr_1_s = NULL,
+diff --git a/sys/arm64/arm64/bus_space_asm.S b/sys/arm64/arm64/bus_space_asm.S
+index 52ad5dd..20d4128 100644
+--- a/sys/arm64/arm64/bus_space_asm.S
++++ b/sys/arm64/arm64/bus_space_asm.S
+@@ -63,7 +63,7 @@ ENTRY(generic_bs_rm_1)
+ 
+ 	/* Read the data. */
+ 1:	ldrb	w1, [x0]
+-	strb	w1, [x3], #2
++	strb	w1, [x3], #1
+ 	subs	x4, x4, #1
+ 	b.ne	1b
+ 
+@@ -105,7 +105,7 @@ ENTRY(generic_bs_rm_4)
+ 
+ 	/* Read the data. */
+ 1:	ldr	w1, [x0]
+-	str	w1, [x3], #2
++	str	w1, [x3], #4
+ 	subs	x4, x4, #1
+ 	b.ne	1b
+ 
+@@ -126,7 +126,7 @@ ENTRY(generic_bs_rm_8)
+ 
+ 	/* Read the data. */
+ 1:	ldr	x1, [x0]
+-	str	x1, [x3], #2
++	str	x1, [x3], #8
+ 	subs	x4, x4, #1
+ 	b.ne	1b
+ 
+diff --git a/sys/arm64/arm64/gic.c b/sys/arm64/arm64/gic.c
+index 59fac99..48a0ef5 100644
+--- a/sys/arm64/arm64/gic.c
++++ b/sys/arm64/arm64/gic.c
+@@ -173,7 +173,7 @@ gic_init_secondary(device_t dev)
+ 
+ 	/* Set all the interrupts to be in Group 0 (secure) */
+ 	for (i = 0; i < sc->nirqs; i += 32) {
+-		gic_d_write_4(sc, GICD_IGROUPR(i >> 5), 0);
++		//gic_d_write_4(sc, GICD_IGROUPR(i >> 5), 0);
+ 	}
+ 
+ 	/* Enable CPU interface */
+@@ -199,7 +199,7 @@ arm_gic_attach(device_t dev)
+ {
+ 	struct		arm_gic_softc *sc;
+ 	int		i;
+-	uint32_t	icciidr;
++	//uint32_t	icciidr;
+ 
+ 	if (arm_gic_sc)
+ 		return (ENXIO);
+@@ -234,10 +234,10 @@ arm_gic_attach(device_t dev)
+ 
+ 	arm_register_root_pic(dev, sc->nirqs);
+ 
+-	icciidr = gic_c_read_4(sc, GICC_IIDR);
+-	device_printf(dev,"pn 0x%x, arch 0x%x, rev 0x%x, implementer 0x%x irqs %u\n",
+-			icciidr>>20, (icciidr>>16) & 0xF, (icciidr>>12) & 0xf,
+-			(icciidr & 0xfff), sc->nirqs);
++	//icciidr = gic_c_read_4(sc, GICC_IIDR);
++	//device_printf(dev,"pn 0x%x, arch 0x%x, rev 0x%x, implementer 0x%x irqs %u\n",
++	//		icciidr>>20, (icciidr>>16) & 0xF, (icciidr>>12) & 0xf,
++	//		(icciidr & 0xfff), sc->nirqs);
+ 
+ 	/* Set all global interrupts to be level triggered, active low. */
+ 	for (i = 32; i < sc->nirqs; i += 16) {
+@@ -257,7 +257,7 @@ arm_gic_attach(device_t dev)
+ 
+ 	/* Set all the interrupts to be in Group 0 (secure) */
+ 	for (i = 0; i < sc->nirqs; i += 32) {
+-		gic_d_write_4(sc, GICD_IGROUPR(i >> 5), 0);
++		//gic_d_write_4(sc, GICD_IGROUPR(i >> 5), 0);
+ 	}
+ 
+ 	/* Enable CPU interface */
+@@ -316,7 +316,7 @@ gic_mask_irq(device_t dev, u_int irq)
+ 	struct arm_gic_softc *sc = device_get_softc(dev);
+ 
+ 	gic_d_write_4(sc, GICD_ICENABLER(irq >> 5), (1UL << (irq & 0x1F)));
+-	gic_c_write_4(sc, GICC_EOIR, irq);
++	//gic_c_write_4(sc, GICC_EOIR, irq);
+ }
+ 
+ void
+diff --git a/sys/arm64/arm64/locore.S b/sys/arm64/arm64/locore.S
+index fc6f843..0ea8bc6 100644
+--- a/sys/arm64/arm64/locore.S
++++ b/sys/arm64/arm64/locore.S
+@@ -302,7 +302,7 @@ create_pagetables:
+ 	/* Get the number of l2 pages to allocate, rounded down */
+ 	lsr	x10, x8, #(L2_SHIFT)
+ 	/* Add 4 MiB for any rounding above and the module data */
+-	add	x10, x10, #2
++	add	x10, x10, #4
+ 
+ 	/* Create the kernel space L2 table */
+ 	mov	x6, x26
+diff --git a/sys/arm64/arm64/machdep.c b/sys/arm64/arm64/machdep.c
+index 954b556..e11fa1c 100644
+--- a/sys/arm64/arm64/machdep.c
++++ b/sys/arm64/arm64/machdep.c
+@@ -819,7 +819,15 @@ initarm(struct arm64_bootparams *abp)
+ 	physmap_idx = 0;
+ 	efihdr = (struct efi_map_header *)preload_search_info(kmdp,
+ 	    MODINFO_METADATA | MODINFOMD_EFI_MAP);
+-	add_efi_map_entries(efihdr, physmap, &physmap_idx);
++ 	if (efihdr != NULL)
++ 		add_efi_map_entries(efihdr, physmap, &physmap_idx);
++ 	else {
++ 		physmap[0] = 0x80000000ul;
++ 		physmap[1] = 0x90000000ul;
++ 		physmap[2] = 0;
++ 		physmap[3] = 0;
++ 		physmap_idx = 2;
++ 	}
+ 
+ 	/* Print the memory map */
+ 	mem_len = 0;
+diff --git a/sys/arm64/conf/GENERIC b/sys/arm64/conf/GENERIC
+index b1d530c..c055aa9 100644
+--- a/sys/arm64/conf/GENERIC
++++ b/sys/arm64/conf/GENERIC
+@@ -66,7 +66,32 @@ options 	KDTRACE_FRAME		# Ensure frames are compiled in
+ options 	KDTRACE_HOOKS		# Kernel DTrace hooks
+ options 	VFP			# Floating-point support
+ 
++# Uncomment this for NFS root
++#options 	NFS_ROOT		# NFS usable as /, requires NFSCL
++#options 	BOOTP_NFSROOT
++#options 	BOOTP_COMPAT
++#options 	BOOTP
++#options 	BOOTP_NFSV3
++#options 	BOOTP_WIRED_TO=em0
++#options 	ROOTDEVNAME=\"nfs:10.5.0.1:/tftpboot/root\"
++
++options 	ROOTDEVNAME=\"ufs:ada0s2\"
++#options 	ROOTDEVNAME=\"ufs:vtbd0s2\"
++
++options 	BOOTVERBOSE
++device		pci
++
++device		ata
++device		scbus
++device		pass
++device		da
++device		ada
++
++device		igb
++device		em
++
+ device		virtio
++device		virtio_pci
+ device		virtio_mmio
+ device		virtio_blk
+ device		vtnet
+diff --git a/sys/conf/files.arm64 b/sys/conf/files.arm64
+index af07ea9..d432337 100644
+--- a/sys/conf/files.arm64
++++ b/sys/conf/files.arm64
+@@ -41,7 +41,8 @@ arm64/arm64/trap.c		standard
+ arm64/arm64/uio_machdep.c	standard
+ arm64/arm64/vfp.c		standard
+ arm64/arm64/vm_machdep.c	standard
+-arm64/cavium/thunder_pcie.c	optional	pci fdt
++#arm64/cavium/thunder_pcie.c	optional	pci fdt
++dev/pci/pci-host-generic.c	optional	pci fdt
+ dev/fdt/fdt_arm64.c		optional	fdt
+ dev/ofw/ofw_cpu.c		optional	fdt
+ dev/psci/psci.c			optional	psci
+diff --git a/sys/dev/e1000/if_lem.c b/sys/dev/e1000/if_lem.c
+index 894a74a..0061078 100644
+--- a/sys/dev/e1000/if_lem.c
++++ b/sys/dev/e1000/if_lem.c
+@@ -2260,7 +2260,7 @@ lem_allocate_pci_resources(struct adapter *adapter)
+ 	adapter->hw.hw_addr = (u8 *)&adapter->osdep.mem_bus_space_handle;
+ 
+ 	/* Only older adapters use IO mapping */
+-	if (adapter->hw.mac.type > e1000_82543) {
++	if (adapter->hw.mac.type > e1000_82543 && 1 == 0) {
+ 		/* Figure our where our IO BAR is ? */
+ 		for (rid = PCIR_BAR(0); rid < PCIR_CIS;) {
+ 			val = pci_read_config(dev, rid, 4);
+diff --git a/sys/dev/pci/pci-host-generic.c b/sys/dev/pci/pci-host-generic.c
+index e69de29..8184db3 100644
+--- a/sys/dev/pci/pci-host-generic.c
++++ b/sys/dev/pci/pci-host-generic.c
+@@ -0,0 +1,690 @@
++/*-
++ * Copyright (c) 2015 Ruslan Bukin <br@bsdpad.com>
++ * Copyright (c) 2014 The FreeBSD Foundation
++ * All rights reserved.
++ *
++ * This software was developed by Semihalf under
++ * the sponsorship of the FreeBSD Foundation.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ * notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ * notice, this list of conditions and the following disclaimer in the
++ * documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
++ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED. IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
++ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
++ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
++ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
++ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
++ * SUCH DAMAGE.
++ */
++
++/* Generic ECAM PCIe */
++
++#include <sys/cdefs.h>
++__FBSDID("$FreeBSD$");
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/malloc.h>
++#include <sys/kernel.h>
++#include <sys/rman.h>
++#include <sys/module.h>
++#include <sys/bus.h>
++#include <sys/endian.h>
++#include <sys/cpuset.h>
++#include <dev/ofw/openfirm.h>
++#include <dev/ofw/ofw_bus.h>
++#include <dev/ofw/ofw_bus_subr.h>
++#include <dev/pci/pcivar.h>
++#include <dev/pci/pcireg.h>
++#include <dev/pci/pcib_private.h>
++#include <machine/cpu.h>
++#include <machine/bus.h>
++#include <machine/fdt.h>
++#include <machine/intr.h>
++#include <dev/fdt/fdt_common.h>
++
++#include "pcib_if.h"
++
++#include <sys/param.h>
++#include <sys/bus.h>
++#include <sys/systm.h>
++#include <sys/kernel.h>
++#include <sys/ktr.h>
++#include <sys/lock.h>
++#include <sys/malloc.h>
++#include <sys/mman.h>
++#include <sys/msgbuf.h>
++#include <sys/mutex.h>
++#include <sys/proc.h>
++#include <sys/rwlock.h>
++#include <sys/sx.h>
++#include <sys/vmem.h>
++#include <sys/vmmeter.h>
++#include <sys/sched.h>
++#include <sys/sysctl.h>
++#include <sys/_unrhdr.h>
++#include <sys/smp.h>
++
++#include <vm/vm.h>
++#include <vm/vm_param.h>
++#include <vm/vm_kern.h>
++#include <vm/vm_page.h>
++#include <vm/vm_map.h>
++#include <vm/vm_object.h>
++#include <vm/vm_extern.h>
++#include <vm/vm_pageout.h>
++#include <vm/vm_pager.h>
++#include <vm/vm_radix.h>
++#include <vm/vm_reserv.h>
++#include <vm/uma.h>
++
++/* Assembling ECAM Configuration Address */
++#define PCIE_BUS_SHIFT	20
++#define PCIE_SLOT_SHIFT 15
++#define PCIE_FUNC_SHIFT 12
++#define PCIE_BUS_MASK	0xFF
++#define PCIE_SLOT_MASK	0x1F
++#define PCIE_FUNC_MASK	0x07
++#define PCIE_REG_MASK	0xFFF
++
++#define PCIE_ADDR_OFFSET(bus, slot, func, reg)			\
++	((((bus) & PCIE_BUS_MASK) << PCIE_BUS_SHIFT)	|	\
++	(((slot) & PCIE_SLOT_MASK) << PCIE_SLOT_SHIFT)	|	\
++	(((func) & PCIE_FUNC_MASK) << PCIE_FUNC_SHIFT)	|	\
++	((reg) & PCIE_REG_MASK))
++
++#define MAX_RANGES_TUPLES	5
++#define MIN_RANGES_TUPLES	2
++
++#define	PCI_IO_WINDOW	0x1000
++#define	PCI_IO_SIZE	0x1000
++#define	PCI_IRQ_START	32
++#define	PCI_IRQ_END	(PCI_IRQ_START + 4)
++
++#define SPACE_CODE_SHIFT	24
++#define SPACE_CODE_MASK		0x3
++#define SPACE_CODE_IO_SPACE	0x1
++#define PROPS_CELL_SIZE		1
++#define PCI_ADDR_CELL_SIZE	2
++
++struct pcie_range {
++	uint64_t	pci_base;
++	uint64_t	phys_base;
++	uint64_t	size;
++};
++
++struct generic_pcie_softc {
++	struct pcie_range	ranges[MAX_RANGES_TUPLES];
++	struct rman		mem_rman;
++	struct rman		io_rman;
++	struct rman		irq_rman;
++	struct resource		*res;
++	struct resource		*res1;
++	int			ecam;
++	bus_space_tag_t		bst;
++	bus_space_handle_t      bsh;
++	device_t		dev;
++	bus_space_handle_t	ioh;
++};
++
++/* Forward prototypes */
++
++static int generic_pcie_probe(device_t dev);
++static int generic_pcie_attach(device_t dev);
++static int parse_pci_mem_ranges(struct generic_pcie_softc *sc);
++static uint32_t generic_pcie_read_config(device_t dev, u_int bus, u_int slot,
++    u_int func, u_int reg, int bytes);
++static void generic_pcie_write_config(device_t dev, u_int bus, u_int slot,
++    u_int func, u_int reg, uint32_t val, int bytes);
++static int generic_pcie_maxslots(device_t dev);
++static int generic_pcie_read_ivar(device_t dev, device_t child, int index,
++    uintptr_t *result);
++static int generic_pcie_write_ivar(device_t dev, device_t child, int index,
++    uintptr_t value);
++static struct resource *generic_pcie_alloc_resource(device_t dev,
++    device_t child, int type, int *rid, u_long start, u_long end,
++    u_long count, u_int flags);
++static int generic_pcie_release_resource(device_t dev, device_t child,
++    int type, int rid, struct resource *res);
++static int generic_pcie_identify_pcib(device_t dev);
++static int generic_pcie_map_msi(device_t pcib, device_t child, int irq,
++    uint64_t *addr, uint32_t *data);
++static int generic_pcie_alloc_msix(device_t pcib, device_t child, int *irq);
++static int generic_pcie_release_msix(device_t pcib, device_t child, int irq);
++static int generic_pcie_alloc_msi(device_t pcib, device_t child, int count,
++    int maxcount, int *irqs);
++static int generic_pcie_release_msi(device_t pcib, device_t child, int count,
++    int *irqs);
++
++static int
++generic_pcie_probe(device_t dev)
++{
++
++	if (!ofw_bus_status_okay(dev))
++		return (ENXIO);
++
++	if (ofw_bus_is_compatible(dev, "pci-host-ecam-generic")) {
++		device_set_desc(dev, "Generic PCI host controller");
++		return (BUS_PROBE_DEFAULT);
++	}
++
++	return (ENXIO);
++}
++
++static int
++generic_pcie_attach(device_t dev)
++{
++	int rid;
++	struct generic_pcie_softc *sc;
++	int error;
++	int tuple;
++	uint64_t base, size;
++
++	sc = device_get_softc(dev);
++	sc->dev = dev;
++
++	/* Identify pcib domain */
++	if (generic_pcie_identify_pcib(dev))
++		return (ENXIO);
++
++	rid = 0;
++	sc->res = bus_alloc_resource_any(dev, SYS_RES_MEMORY, &rid, RF_ACTIVE);
++	if (sc->res == NULL) {
++		device_printf(dev, "could not map memory.\n");
++		return (ENXIO);
++	}
++
++	sc->bst = rman_get_bustag(sc->res);
++	sc->bsh = rman_get_bushandle(sc->res);
++
++	sc->mem_rman.rm_type = RMAN_ARRAY;
++	sc->mem_rman.rm_descr = "PCIe Memory";
++
++	/* Retrieve 'ranges' property from FDT */
++
++	if (bootverbose)
++		device_printf(dev, "parsing FDT for ECAM%d:\n",
++		    sc->ecam);
++	if (parse_pci_mem_ranges(sc))
++		return (ENXIO);
++
++	/* Initialize rman and allocate memory regions */
++
++	error = rman_init(&sc->mem_rman);
++	if (error) {
++		device_printf(dev, "rman_init() failed. error = %d\n", error);
++		return (error);
++	}
++
++	for (tuple = 0; tuple < MAX_RANGES_TUPLES; tuple++) {
++		base = sc->ranges[tuple].phys_base;
++		size = sc->ranges[tuple].size;
++		if (base == 0 || size == 0)
++			continue; /* empty range element */
++
++		error = rman_manage_region(&sc->mem_rman, base, base + size - 1);
++		if (error) {
++			device_printf(dev, "rman_manage_region() failed. error = %d\n", error);
++			rman_fini(&sc->mem_rman);
++			return (error);
++		}
++	}
++
++	/* Initialize IO */
++	sc->io_rman.rm_type = RMAN_ARRAY;
++	sc->io_rman.rm_descr = "PCIe IO window";
++	if (rman_init(&sc->io_rman) != 0 ||
++		rman_manage_region(&sc->io_rman, PCI_IO_WINDOW,
++		    PCI_IO_WINDOW + PCI_IO_SIZE - 1) != 0) {
++		panic("failed to set up I/O rman");
++	}
++
++	/* IRQ */
++        sc->irq_rman.rm_type = RMAN_ARRAY;
++        sc->irq_rman.rm_descr = "versatile PCI IRQs";
++        if (rman_init(&sc->irq_rman) != 0 ||
++            rman_manage_region(&sc->irq_rman, PCI_IRQ_START,
++                PCI_IRQ_END) != 0) {
++                panic("versatile_pci_attach: failed to set up IRQ rman");
++        }   
++
++	device_add_child(dev, "pci", -1);
++	return (bus_generic_attach(dev));
++}
++
++static int
++parse_pci_mem_ranges(struct generic_pcie_softc *sc)
++{
++	phandle_t node;
++	pcell_t pci_addr_cells, parent_addr_cells, size_cells;
++	pcell_t attributes;
++	pcell_t *ranges_buf, *cell_ptr;
++	int cells_count, tuples_count;
++	int tuple;
++	int rv;
++
++	node = ofw_bus_get_node(sc->dev);
++
++	if (fdt_addrsize_cells(node, &pci_addr_cells, &size_cells))
++		return (ENXIO);
++
++	parent_addr_cells = fdt_parent_addr_cells(node);
++	if (parent_addr_cells != 2 || pci_addr_cells != 3 || size_cells != 2) {
++		device_printf(sc->dev,
++		    "Unexpected number of address or size cells in FDT\n");
++		return (ENXIO);
++	}
++
++	cells_count = OF_getprop_alloc(node, "ranges",
++	    sizeof(pcell_t), (void **)&ranges_buf);
++	if (cells_count == -1) {
++		device_printf(sc->dev, "Error parsing FDT 'ranges' property\n");
++		return (ENXIO);
++	}
++
++	tuples_count = cells_count /
++	    (pci_addr_cells + parent_addr_cells + size_cells);
++	if (tuples_count > MAX_RANGES_TUPLES || tuples_count < MIN_RANGES_TUPLES) {
++		device_printf(sc->dev,
++		    "Unexpected number of 'ranges' tuples in FDT\n");
++		rv = ENXIO;
++		goto out;
++	}
++
++	cell_ptr = ranges_buf;
++
++	for (tuple = 0; tuple < tuples_count; tuple++) {
++		attributes = fdt_data_get((void *)cell_ptr, PROPS_CELL_SIZE);
++		attributes = (attributes >> SPACE_CODE_SHIFT) & SPACE_CODE_MASK;
++		if (attributes == SPACE_CODE_IO_SPACE) {
++			/* Ignore I/O space range, mark as empty */
++			sc->ranges[tuple].phys_base = 0;
++			sc->ranges[tuple].size = 0;
++			cell_ptr +=
++			    (pci_addr_cells + parent_addr_cells + size_cells);
++			continue;
++		}
++		cell_ptr += PROPS_CELL_SIZE; /* move ptr to pci addr */
++		sc->ranges[tuple].pci_base = fdt_data_get((void *)cell_ptr, 2);
++		cell_ptr += PCI_ADDR_CELL_SIZE; /* move ptr to cpu addr */
++		sc->ranges[tuple].phys_base = fdt_data_get((void *)cell_ptr, 2);
++		cell_ptr += parent_addr_cells; /* move ptr to size cells*/
++		sc->ranges[tuple].size = fdt_data_get((void *)cell_ptr, 2);
++		cell_ptr += size_cells; /* move ptr to next tuple*/
++
++		if (bootverbose) {
++			device_printf(sc->dev,
++			    "\tPCI addr: 0x%jx, CPU addr: 0x%jx, Size: 0x%jx\n",
++			    sc->ranges[tuple].pci_base,
++			    sc->ranges[tuple].phys_base,
++			    sc->ranges[tuple].size);
++		}
++
++	}
++	for (; tuple < MAX_RANGES_TUPLES; tuple++) {
++		/* zero-fill remaining tuples to mark empty elements in array */
++		sc->ranges[tuple].phys_base = 0;
++		sc->ranges[tuple].size = 0;
++	}
++
++	rv = 0;
++out:
++	free(ranges_buf, M_OFWPROP);
++	return (rv);
++}
++
++static uint32_t
++generic_pcie_read_config(device_t dev, u_int bus, u_int slot,
++    u_int func, u_int reg, int bytes)
++{
++	uint64_t offset;
++	uint32_t data;
++	struct generic_pcie_softc *sc;
++	bus_space_tag_t	t;
++	bus_space_handle_t h;
++
++	if (bus > 255 || slot > 31 || func > 7 || reg > 4095)
++		return (~0U);
++
++	sc = device_get_softc(dev);
++
++	offset = PCIE_ADDR_OFFSET(bus, slot, func, reg);
++	t = sc->bst;
++	h = sc->bsh;
++
++	switch (bytes) {
++	case 1:
++		data = bus_space_read_1(t, h, offset);
++		break;
++	case 2:
++		data = le16toh(bus_space_read_2(t, h, offset));
++		break;
++	case 4:
++		data = le32toh(bus_space_read_4(t, h, offset));
++		break;
++	default:
++		return (~0U);
++	}
++
++	if (reg == PCIR_INTLINE) {
++		data += 32;
++	}
++	return (data);
++}
++
++static void
++generic_pcie_write_config(device_t dev, u_int bus, u_int slot,
++    u_int func, u_int reg, uint32_t val, int bytes)
++{
++	uint64_t offset;
++	struct generic_pcie_softc *sc;
++	bus_space_tag_t	t;
++	bus_space_handle_t h;
++
++	if (bus > 255 || slot > 31 || func > 7 || reg > 4095)
++		return;
++
++	sc = device_get_softc(dev);
++
++	offset = PCIE_ADDR_OFFSET(bus, slot, func, reg);
++
++	t = sc->bst;
++	h = sc->bsh;
++
++	switch (bytes) {
++	case 1:
++		bus_space_write_1(t, h, offset, val);
++		break;
++	case 2:
++		bus_space_write_2(t, h, offset, htole16(val));
++		break;
++	case 4:
++		bus_space_write_4(t, h, offset, htole32(val));
++		break;
++	default:
++		return;
++	}
++}
++
++static int
++generic_pcie_maxslots(device_t dev)
++{
++
++	return 31; /* max slots per bus acc. to standard */
++}
++
++static int
++generic_pcie_read_ivar(device_t dev, device_t child, int index,
++    uintptr_t *result)
++{
++	struct generic_pcie_softc *sc;
++	int secondary_bus = 0;
++
++	sc = device_get_softc(dev);
++
++	if (index == PCIB_IVAR_BUS) {
++		/* this pcib adds only pci bus 0 as child */
++		secondary_bus = 0;
++
++		*result = secondary_bus;
++		return (0);
++
++	}
++	if (index == PCI_IVAR_IRQ) {
++		printf("PCIB_IVAR_IRQ\n");
++	}
++	if (index == PCIB_IVAR_DOMAIN) {
++		*result = sc->ecam;
++		return (0);
++	}
++
++	device_printf(dev, "ERROR: Unknown index.\n");
++	return (ENOENT);
++}
++
++static int
++generic_pcie_write_ivar(device_t dev, device_t child, int index,
++    uintptr_t value)
++{
++
++	return (ENOENT);
++}
++
++static int
++generic_pcie_release_resource(device_t dev, device_t child, int type, int rid,
++    struct resource *res)
++{
++
++	if (type != SYS_RES_MEMORY)
++		return (BUS_RELEASE_RESOURCE(device_get_parent(dev), child,
++		    type, rid, res));
++
++	return (rman_release_resource(res));
++}
++
++static struct resource *
++generic_pcie_alloc_resource(device_t dev, device_t child, int type, int *rid,
++    u_long start, u_long end, u_long count, u_int flags)
++{
++	struct generic_pcie_softc *sc = device_get_softc(dev);
++	struct rman *rm = NULL;
++	struct resource *res;
++
++	switch (type) {
++	case SYS_RES_IOPORT:
++		rm = &sc->io_rman;
++		break;
++	case SYS_RES_MEMORY:
++		rm = &sc->mem_rman;
++		break;
++	case SYS_RES_IRQ:
++		rm = &sc->irq_rman;
++		break;
++	default:
++		return (BUS_ALLOC_RESOURCE(device_get_parent(dev), dev,
++		    type, rid, start, end, count, flags));
++	};
++
++	//if ((start == 0UL) && (end == ~0UL)) {
++	//	device_printf(dev,
++	//	    "Cannot allocate resource with unspecified range\n");
++	//	goto fail;
++	//}
++
++	/* XXX ARM64TODO: Find better way to check if addr needs to be translated */
++	//if (!(start & 0xF00000000000UL)) {
++	//	printf("need translation\n");
++	//	start = range_addr_pci_to_phys(sc, start);
++	//	end = start + count - 1;
++	//	printf("translated start 0x%lx end 0x%lx\n", start, end);
++	//	/* Check if address translation was successful */
++	//	if (start == 0)
++	//		goto fail;
++	//}
++
++	if (bootverbose) {
++		device_printf(dev,
++		    "rman_reserve_resource: start=%#lx, end=%#lx, count=%#lx\n",
++		    start, end, count);
++	}
++
++	res = rman_reserve_resource(rm, start, end, count, flags, child);
++	if (res == NULL)
++		goto fail;
++
++	rman_set_rid(res, *rid);
++	rman_set_bustag(res, fdtbus_bs_tag);
++	rman_set_bushandle(res, start);
++
++	if (flags & RF_ACTIVE)
++		if (bus_activate_resource(child, type, *rid, res)) {
++			rman_release_resource(res);
++			goto fail;
++		}
++
++	return (res);
++
++fail:
++	if (bootverbose) {
++		device_printf(dev, "%s FAIL: type=%d, rid=%d, "
++		    "start=%016lx, end=%016lx, count=%016lx, flags=%x\n",
++		    __func__, type, *rid, start, end, count, flags);
++	}
++
++	return (NULL);
++}
++
++static int
++generic_pcie_activate_resource(device_t dev, device_t child, int type, int rid,
++    struct resource *r)
++{
++	vm_offset_t vaddr;
++	int res;
++
++	switch(type) {
++	case SYS_RES_IOPORT:
++		/* TODO: get IOPORT start from FDT */
++		vaddr = (vm_offset_t)pmap_mapdev(rman_get_start(r) + 0x2f000000,
++				rman_get_size(r));
++		rman_set_bushandle(r, vaddr);
++		res = rman_activate_resource(r);
++		break;
++	case SYS_RES_MEMORY:
++		res = (BUS_ACTIVATE_RESOURCE(device_get_parent(dev),
++		    child, type, rid, r));
++		break;
++	case SYS_RES_IRQ:
++		printf("Activate irq res rid %d\n", rid);
++		res = 0;
++		break;
++	default:
++		res = ENXIO;
++		break;
++	}
++
++	return (res);
++}
++
++static int
++generic_pcie_setup_intr(device_t bus, device_t child, struct resource *ires,
++	    int flags, driver_filter_t *filt, driver_intr_t *handler,
++	    void *arg, void **cookiep)
++{
++
++	return BUS_SETUP_INTR(device_get_parent(bus), bus, ires, flags,
++	    filt, handler, arg, cookiep);
++}
++
++static int
++generic_pcie_teardown_intr(device_t dev, device_t child, struct resource *ires,
++    void *cookie)
++{
++
++	return BUS_TEARDOWN_INTR(device_get_parent(dev), dev, ires, cookie);
++}
++
++static int
++generic_pcie_identify_pcib(device_t dev)
++{
++	struct generic_pcie_softc *sc;
++	u_long start;
++
++	sc = device_get_softc(dev);
++	start = bus_get_resource_start(dev, SYS_RES_MEMORY, 0);
++
++	return (0);
++}
++
++static int
++generic_pcie_map_msi(device_t pcib, device_t child, int irq,
++    uint64_t *addr, uint32_t *data)
++{
++	int error;
++
++	error = arm_map_msix(child, irq, addr, data);
++	return (error);
++}
++
++static int
++generic_pcie_alloc_msix(device_t pcib, device_t child, int *irq)
++{
++	int error;
++
++	error = arm_alloc_msix(child, irq);
++	return (error);
++}
++
++static int
++generic_pcie_release_msix(device_t pcib, device_t child, int irq)
++{
++	int error;
++
++	error = arm_release_msix(child, irq);
++	return (error);
++}
++
++static int
++generic_pcie_alloc_msi(device_t pcib, device_t child, int count, int maxcount,
++    int *irqs)
++{
++	int error;
++
++	error = arm_alloc_msi(child, count, irqs);
++	return (error);
++}
++
++static int
++generic_pcie_release_msi(device_t pcib, device_t child, int count, int *irqs)
++{
++	int error;
++
++	error = arm_release_msi(child, count, irqs);
++	return (error);
++}
++
++static device_method_t generic_pcie_methods[] = {
++	DEVMETHOD(device_probe,			generic_pcie_probe),
++	DEVMETHOD(device_attach,		generic_pcie_attach),
++	DEVMETHOD(pcib_maxslots,		generic_pcie_maxslots),
++	DEVMETHOD(pcib_read_config,		generic_pcie_read_config),
++	DEVMETHOD(pcib_write_config,		generic_pcie_write_config),
++	DEVMETHOD(bus_read_ivar,		generic_pcie_read_ivar),
++	DEVMETHOD(bus_write_ivar,		generic_pcie_write_ivar),
++	DEVMETHOD(bus_alloc_resource,		generic_pcie_alloc_resource),
++	DEVMETHOD(bus_release_resource,		generic_pcie_release_resource),
++	DEVMETHOD(bus_activate_resource,	generic_pcie_activate_resource),
++	DEVMETHOD(bus_deactivate_resource,	bus_generic_deactivate_resource),
++	DEVMETHOD(bus_setup_intr,		generic_pcie_setup_intr),
++	DEVMETHOD(bus_teardown_intr,		generic_pcie_teardown_intr),
++	DEVMETHOD(pcib_map_msi,			generic_pcie_map_msi),
++	DEVMETHOD(pcib_alloc_msix,		generic_pcie_alloc_msix),
++	DEVMETHOD(pcib_release_msix,		generic_pcie_release_msix),
++	DEVMETHOD(pcib_alloc_msi,		generic_pcie_alloc_msi),
++	DEVMETHOD(pcib_release_msi,		generic_pcie_release_msi),
++
++	DEVMETHOD_END
++};
++
++static driver_t generic_pcie_driver = {
++	"pcib",
++	generic_pcie_methods,
++	sizeof(struct generic_pcie_softc),
++};
++
++static devclass_t generic_pcie_devclass;
++
++DRIVER_MODULE(pcib, simplebus, generic_pcie_driver,
++generic_pcie_devclass, 0, 0);
++DRIVER_MODULE(pcib, ofwbus, generic_pcie_driver,
++generic_pcie_devclass, 0, 0);
+diff --git a/sys/dev/uart/uart_dev_pl011.c b/sys/dev/uart/uart_dev_pl011.c
+index e90e7f8..b026e1b 100644
+--- a/sys/dev/uart/uart_dev_pl011.c
++++ b/sys/dev/uart/uart_dev_pl011.c
+@@ -160,8 +160,10 @@ uart_pl011_param(struct uart_bas *bas, int baudrate, int databits, int stopbits,
+ 	else
+ 		line &= ~LCR_H_PEN;
+ 
++	/* Enable FIFO */
++	line |= LCR_H_FEN;
++
+ 	/* Configure the rest */
+-	line &=  ~LCR_H_FEN;
+ 	ctrl |= (CR_RXE | CR_TXE | CR_UARTEN);
+ 
+ 	if (bas->rclk != 0 && baudrate != 0) {
+@@ -198,8 +200,8 @@ uart_pl011_putc(struct uart_bas *bas, int c)
+ {
+ 
+ 	/* Wait when TX FIFO full. Push character otherwise. */
+-	while (__uart_getreg(bas, UART_FR) & FR_TXFF)
+-		;
++	//while (__uart_getreg(bas, UART_FR) & FR_TXFF)
++	//	;
+ 	__uart_setreg(bas, UART_DR, c & 0xff);
+ }
+ 
+@@ -398,8 +400,8 @@ uart_pl011_bus_probe(struct uart_softc *sc)
+ 
+ 	device_set_desc(sc->sc_dev, "PrimeCell UART (PL011)");
+ 
+-	sc->sc_rxfifosz = 1;
+-	sc->sc_txfifosz = 1;
++	sc->sc_rxfifosz = 16;
++	sc->sc_txfifosz = 16;
+ 
+ 	return (0);
+ }
+@@ -428,8 +430,6 @@ uart_pl011_bus_receive(struct uart_softc *sc)
+ 		if (xc & DR_PE)
+ 			rx |= UART_STAT_PARERR;
+ 
+-		__uart_setreg(bas, UART_ICR, (UART_RXREADY | RIS_RTIM));
+-
+ 		uart_rx_put(sc, rx);
+ 		ints = __uart_getreg(bas, UART_MIS);
+ 	}
+diff --git a/sys/dev/virtio/pci/virtio_pci.c b/sys/dev/virtio/pci/virtio_pci.c
+index c4f81fd..4ed914f 100644
+--- a/sys/dev/virtio/pci/virtio_pci.c
++++ b/sys/dev/virtio/pci/virtio_pci.c
+@@ -268,7 +268,7 @@ vtpci_attach(device_t dev)
+ 	pci_enable_busmaster(dev);
+ 
+ 	rid = PCIR_BAR(0);
+-	sc->vtpci_res = bus_alloc_resource_any(dev, SYS_RES_IOPORT, &rid,
++	sc->vtpci_res = bus_alloc_resource_any(dev, SYS_RES_MEMORY, &rid,
+ 	    RF_ACTIVE);
+ 	if (sc->vtpci_res == NULL) {
+ 		device_printf(dev, "cannot map I/O space\n");
