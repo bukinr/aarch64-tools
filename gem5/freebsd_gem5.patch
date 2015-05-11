@@ -1,6 +1,6 @@
 Index: sys/arm/arm/generic_timer.c
 ===================================================================
---- sys/arm/arm/generic_timer.c	(revision 282200)
+--- sys/arm/arm/generic_timer.c	(revision 282765)
 +++ sys/arm/arm/generic_timer.c	(working copy)
 @@ -85,7 +85,7 @@
  static struct resource_spec timer_spec[] = {
@@ -11,10 +11,11 @@ Index: sys/arm/arm/generic_timer.c
  	{ SYS_RES_IRQ,		3,	RF_ACTIVE | RF_OPTIONAL	}, /* Hyp */
  	{ -1, 0 }
  };
-@@ -307,10 +307,12 @@
+@@ -307,10 +307,13 @@
  	sc->physical = false;
  #endif
  
++	/* Gem5 TODO */
 +	sc->physical = true;
 +
  	arm_tmr_sc = sc;
@@ -25,1509 +26,33 @@ Index: sys/arm/arm/generic_timer.c
  		error = bus_setup_intr(dev, sc->res[i], INTR_TYPE_CLK,
  		    arm_tmr_intr, NULL, sc, &sc->ihl[i]);
  		if (error) {
-Index: sys/arm64/arm64/busdma_bounce.c
-===================================================================
---- sys/arm64/arm64/busdma_bounce.c	(revision 0)
-+++ sys/arm64/arm64/busdma_bounce.c	(working copy)
-@@ -0,0 +1,1086 @@
-+/*-
-+ * Copyright (c) 1997, 1998 Justin T. Gibbs.
-+ * Copyright (c) 2015 The FreeBSD Foundation
-+ * All rights reserved.
-+ *
-+ * Portions of this software were developed by Semihalf
-+ * under sponsorship of the FreeBSD Foundation.
-+ *
-+ * Redistribution and use in source and binary forms, with or without
-+ * modification, are permitted provided that the following conditions
-+ * are met:
-+ * 1. Redistributions of source code must retain the above copyright
-+ *    notice, this list of conditions, and the following disclaimer,
-+ *    without modification, immediately at the beginning of the file.
-+ * 2. The name of the author may not be used to endorse or promote products
-+ *    derived from this software without specific prior written permission.
-+ *
-+ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
-+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
-+ * ARE DISCLAIMED. IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE FOR
-+ * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
-+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
-+ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
-+ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
-+ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
-+ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
-+ * SUCH DAMAGE.
-+ */
-+
-+#include <sys/cdefs.h>
-+__FBSDID("$FreeBSD$");
-+
-+#include <sys/param.h>
-+#include <sys/systm.h>
-+#include <sys/malloc.h>
-+#include <sys/bus.h>
-+#include <sys/interrupt.h>
-+#include <sys/kernel.h>
-+#include <sys/ktr.h>
-+#include <sys/lock.h>
-+#include <sys/proc.h>
-+#include <sys/memdesc.h>
-+#include <sys/mutex.h>
-+#include <sys/sysctl.h>
-+#include <sys/uio.h>
-+
-+#include <vm/vm.h>
-+#include <vm/vm_extern.h>
-+#include <vm/vm_kern.h>
-+#include <vm/vm_page.h>
-+#include <vm/vm_map.h>
-+
-+#include <machine/atomic.h>
-+#include <machine/bus.h>
-+#include <machine/md_var.h>
-+#include <arm64/include/bus_dma_impl.h>
-+
-+#define MAX_BPAGES 4096
-+
-+enum {
-+	BUS_DMA_COULD_BOUNCE	= 0x01,
-+	BUS_DMA_MIN_ALLOC_COMP	= 0x02,
-+	BUS_DMA_KMEM_ALLOC	= 0x04,
-+};
-+
-+struct bounce_zone;
-+
-+struct bus_dma_tag {
-+	struct bus_dma_tag_common common;
-+	int			map_count;
-+	int			bounce_flags;
-+	bus_dma_segment_t	*segments;
-+	struct bounce_zone	*bounce_zone;
-+};
-+
-+struct bounce_page {
-+	vm_offset_t	vaddr;		/* kva of bounce buffer */
-+	bus_addr_t	busaddr;	/* Physical address */
-+	vm_offset_t	datavaddr;	/* kva of client data */
-+	bus_addr_t	dataaddr;	/* client physical address */
-+	bus_size_t	datacount;	/* client data count */
-+	STAILQ_ENTRY(bounce_page) links;
-+};
-+
-+int busdma_swi_pending;
-+
-+struct bounce_zone {
-+	STAILQ_ENTRY(bounce_zone) links;
-+	STAILQ_HEAD(bp_list, bounce_page) bounce_page_list;
-+	int		total_bpages;
-+	int		free_bpages;
-+	int		reserved_bpages;
-+	int		active_bpages;
-+	int		total_bounced;
-+	int		total_deferred;
-+	int		map_count;
-+	bus_size_t	alignment;
-+	bus_addr_t	lowaddr;
-+	char		zoneid[8];
-+	char		lowaddrid[20];
-+	struct sysctl_ctx_list sysctl_tree;
-+	struct sysctl_oid *sysctl_tree_top;
-+};
-+
-+static struct mtx bounce_lock;
-+static int total_bpages;
-+static int busdma_zonecount;
-+static STAILQ_HEAD(, bounce_zone) bounce_zone_list;
-+
-+static SYSCTL_NODE(_hw, OID_AUTO, busdma, CTLFLAG_RD, 0, "Busdma parameters");
-+SYSCTL_INT(_hw_busdma, OID_AUTO, total_bpages, CTLFLAG_RD, &total_bpages, 0,
-+	   "Total bounce pages");
-+
-+struct bus_dmamap {
-+	struct bp_list	       bpages;
-+	int		       pagesneeded;
-+	int		       pagesreserved;
-+	bus_dma_tag_t	       dmat;
-+	struct memdesc	       mem;
-+	bus_dmamap_callback_t *callback;
-+	void		      *callback_arg;
-+	STAILQ_ENTRY(bus_dmamap) links;
-+};
-+
-+static STAILQ_HEAD(, bus_dmamap) bounce_map_waitinglist;
-+static STAILQ_HEAD(, bus_dmamap) bounce_map_callbacklist;
-+static struct bus_dmamap nobounce_dmamap;
-+
-+static void init_bounce_pages(void *dummy);
-+static int alloc_bounce_zone(bus_dma_tag_t dmat);
-+static int alloc_bounce_pages(bus_dma_tag_t dmat, u_int numpages);
-+static int reserve_bounce_pages(bus_dma_tag_t dmat, bus_dmamap_t map,
-+				int commit);
-+static bus_addr_t add_bounce_page(bus_dma_tag_t dmat, bus_dmamap_t map,
-+				  vm_offset_t vaddr, bus_addr_t addr,
-+				  bus_size_t size);
-+static void free_bounce_page(bus_dma_tag_t dmat, struct bounce_page *bpage);
-+int run_filter(bus_dma_tag_t dmat, bus_addr_t paddr);
-+static void _bus_dmamap_count_pages(bus_dma_tag_t dmat, bus_dmamap_t map,
-+				    pmap_t pmap, void *buf, bus_size_t buflen,
-+				    int flags);
-+static void _bus_dmamap_count_phys(bus_dma_tag_t dmat, bus_dmamap_t map,
-+				   vm_paddr_t buf, bus_size_t buflen,
-+				   int flags);
-+static int _bus_dmamap_reserve_pages(bus_dma_tag_t dmat, bus_dmamap_t map,
-+				     int flags);
-+
-+/*
-+ * Allocate a device specific dma_tag.
-+ */
-+static int
-+bounce_bus_dma_tag_create(bus_dma_tag_t parent, bus_size_t alignment,
-+    bus_addr_t boundary, bus_addr_t lowaddr, bus_addr_t highaddr,
-+    bus_dma_filter_t *filter, void *filterarg, bus_size_t maxsize,
-+    int nsegments, bus_size_t maxsegsz, int flags, bus_dma_lock_t *lockfunc,
-+    void *lockfuncarg, bus_dma_tag_t *dmat)
-+{
-+	bus_dma_tag_t newtag;
-+	int error;
-+
-+	*dmat = NULL;
-+	error = common_bus_dma_tag_create(parent != NULL ? &parent->common :
-+	    NULL, alignment, boundary, lowaddr, highaddr, filter, filterarg,
-+	    maxsize, nsegments, maxsegsz, flags, lockfunc, lockfuncarg,
-+	    sizeof (struct bus_dma_tag), (void **)&newtag);
-+	if (error != 0)
-+		return (error);
-+
-+	newtag->common.impl = &bus_dma_bounce_impl;
-+	newtag->map_count = 0;
-+	newtag->segments = NULL;
-+
-+	if (parent != NULL && ((newtag->common.filter != NULL) ||
-+	    ((parent->bounce_flags & BUS_DMA_COULD_BOUNCE) != 0)))
-+		newtag->bounce_flags |= BUS_DMA_COULD_BOUNCE;
-+
-+	if (newtag->common.lowaddr < ptoa((vm_paddr_t)Maxmem) ||
-+	    newtag->common.alignment > 1)
-+		newtag->bounce_flags |= BUS_DMA_COULD_BOUNCE;
-+
-+	if (((newtag->bounce_flags & BUS_DMA_COULD_BOUNCE) != 0) &&
-+	    (flags & BUS_DMA_ALLOCNOW) != 0) {
-+		struct bounce_zone *bz;
-+
-+		/* Must bounce */
-+		if ((error = alloc_bounce_zone(newtag)) != 0) {
-+			free(newtag, M_DEVBUF);
-+			return (error);
-+		}
-+		bz = newtag->bounce_zone;
-+
-+		if (ptoa(bz->total_bpages) < maxsize) {
-+			int pages;
-+
-+			pages = atop(maxsize) - bz->total_bpages;
-+
-+			/* Add pages to our bounce pool */
-+			if (alloc_bounce_pages(newtag, pages) < pages)
-+				error = ENOMEM;
-+		}
-+		/* Performed initial allocation */
-+		newtag->bounce_flags |= BUS_DMA_MIN_ALLOC_COMP;
-+	} else
-+		error = 0;
-+	
-+	if (error != 0)
-+		free(newtag, M_DEVBUF);
-+	else
-+		*dmat = newtag;
-+	CTR4(KTR_BUSDMA, "%s returned tag %p tag flags 0x%x error %d",
-+	    __func__, newtag, (newtag != NULL ? newtag->common.flags : 0),
-+	    error);
-+	return (error);
-+}
-+
-+static int
-+bounce_bus_dma_tag_destroy(bus_dma_tag_t dmat)
-+{
-+	bus_dma_tag_t dmat_copy, parent;
-+	int error;
-+
-+	error = 0;
-+	dmat_copy = dmat;
-+
-+	if (dmat != NULL) {
-+		if (dmat->map_count != 0) {
-+			error = EBUSY;
-+			goto out;
-+		}
-+		while (dmat != NULL) {
-+			parent = (bus_dma_tag_t)dmat->common.parent;
-+			atomic_subtract_int(&dmat->common.ref_count, 1);
-+			if (dmat->common.ref_count == 0) {
-+				if (dmat->segments != NULL)
-+					free(dmat->segments, M_DEVBUF);
-+				free(dmat, M_DEVBUF);
-+				/*
-+				 * Last reference count, so
-+				 * release our reference
-+				 * count on our parent.
-+				 */
-+				dmat = parent;
-+			} else
-+				dmat = NULL;
-+		}
-+	}
-+out:
-+	CTR3(KTR_BUSDMA, "%s tag %p error %d", __func__, dmat_copy, error);
-+	return (error);
-+}
-+
-+/*
-+ * Allocate a handle for mapping from kva/uva/physical
-+ * address space into bus device space.
-+ */
-+static int
-+bounce_bus_dmamap_create(bus_dma_tag_t dmat, int flags, bus_dmamap_t *mapp)
-+{
-+	struct bounce_zone *bz;
-+	int error, maxpages, pages;
-+
-+	error = 0;
-+
-+	if (dmat->segments == NULL) {
-+		dmat->segments = (bus_dma_segment_t *)malloc(
-+		    sizeof(bus_dma_segment_t) * dmat->common.nsegments,
-+		    M_DEVBUF, M_NOWAIT);
-+		if (dmat->segments == NULL) {
-+			CTR3(KTR_BUSDMA, "%s: tag %p error %d",
-+			    __func__, dmat, ENOMEM);
-+			return (ENOMEM);
-+		}
-+	}
-+
-+	/*
-+	 * Bouncing might be required if the driver asks for an active
-+	 * exclusion region, a data alignment that is stricter than 1, and/or
-+	 * an active address boundary.
-+	 */
-+	if (dmat->bounce_flags & BUS_DMA_COULD_BOUNCE) {
-+		/* Must bounce */
-+		if (dmat->bounce_zone == NULL) {
-+			if ((error = alloc_bounce_zone(dmat)) != 0)
-+				return (error);
-+		}
-+		bz = dmat->bounce_zone;
-+
-+		*mapp = (bus_dmamap_t)malloc(sizeof(**mapp), M_DEVBUF,
-+		    M_NOWAIT | M_ZERO);
-+		if (*mapp == NULL) {
-+			CTR3(KTR_BUSDMA, "%s: tag %p error %d",
-+			    __func__, dmat, ENOMEM);
-+			return (ENOMEM);
-+		}
-+
-+		/* Initialize the new map */
-+		STAILQ_INIT(&((*mapp)->bpages));
-+
-+		/*
-+		 * Attempt to add pages to our pool on a per-instance
-+		 * basis up to a sane limit.
-+		 */
-+		if (dmat->common.alignment > 1)
-+			maxpages = MAX_BPAGES;
-+		else
-+			maxpages = MIN(MAX_BPAGES, Maxmem -
-+			    atop(dmat->common.lowaddr));
-+		if ((dmat->bounce_flags & BUS_DMA_MIN_ALLOC_COMP) == 0 ||
-+		    (bz->map_count > 0 && bz->total_bpages < maxpages)) {
-+			pages = MAX(atop(dmat->common.maxsize), 1);
-+			pages = MIN(maxpages - bz->total_bpages, pages);
-+			pages = MAX(pages, 1);
-+			if (alloc_bounce_pages(dmat, pages) < pages)
-+				error = ENOMEM;
-+			if ((dmat->bounce_flags & BUS_DMA_MIN_ALLOC_COMP)
-+			    == 0) {
-+				if (error == 0) {
-+					dmat->bounce_flags |=
-+					    BUS_DMA_MIN_ALLOC_COMP;
-+				}
-+			} else
-+				error = 0;
-+		}
-+		bz->map_count++;
-+	} else {
-+		*mapp = NULL;
-+	}
-+	if (error == 0)
-+		dmat->map_count++;
-+	CTR4(KTR_BUSDMA, "%s: tag %p tag flags 0x%x error %d",
-+	    __func__, dmat, dmat->common.flags, error);
-+	return (error);
-+}
-+
-+/*
-+ * Destroy a handle for mapping from kva/uva/physical
-+ * address space into bus device space.
-+ */
-+static int
-+bounce_bus_dmamap_destroy(bus_dma_tag_t dmat, bus_dmamap_t map)
-+{
-+
-+	if (map != NULL && map != &nobounce_dmamap) {
-+		if (STAILQ_FIRST(&map->bpages) != NULL) {
-+			CTR3(KTR_BUSDMA, "%s: tag %p error %d",
-+			    __func__, dmat, EBUSY);
-+			return (EBUSY);
-+		}
-+		if (dmat->bounce_zone)
-+			dmat->bounce_zone->map_count--;
-+		free(map, M_DEVBUF);
-+	}
-+	dmat->map_count--;
-+	CTR2(KTR_BUSDMA, "%s: tag %p error 0", __func__, dmat);
-+	return (0);
-+}
-+
-+
-+/*
-+ * Allocate a piece of memory that can be efficiently mapped into
-+ * bus device space based on the constraints lited in the dma tag.
-+ * A dmamap to for use with dmamap_load is also allocated.
-+ */
-+static int
-+bounce_bus_dmamem_alloc(bus_dma_tag_t dmat, void** vaddr, int flags,
-+    bus_dmamap_t *mapp)
-+{
-+	/*
-+	 * XXX ARM64TODO:
-+	 * This bus_dma implementation requires IO-Coherent architecutre.
-+	 * If IO-Coherency is not guaranteed, the BUS_DMA_COHERENT flag has
-+	 * to be implented using non-cacheable memory.
-+	 */
-+
-+	vm_memattr_t attr;
-+	int mflags;
-+
-+	if (flags & BUS_DMA_NOWAIT)
-+		mflags = M_NOWAIT;
-+	else
-+		mflags = M_WAITOK;
-+
-+	/* If we succeed, no mapping/bouncing will be required */
-+	*mapp = NULL;
-+
-+	if (dmat->segments == NULL) {
-+		dmat->segments = (bus_dma_segment_t *)malloc(
-+		    sizeof(bus_dma_segment_t) * dmat->common.nsegments,
-+		    M_DEVBUF, mflags);
-+		if (dmat->segments == NULL) {
-+			CTR4(KTR_BUSDMA, "%s: tag %p tag flags 0x%x error %d",
-+			    __func__, dmat, dmat->common.flags, ENOMEM);
-+			return (ENOMEM);
-+		}
-+	}
-+	if (flags & BUS_DMA_ZERO)
-+		mflags |= M_ZERO;
-+	if (flags & BUS_DMA_NOCACHE)
-+		attr = VM_MEMATTR_UNCACHEABLE;
-+	else
-+		attr = VM_MEMATTR_DEFAULT;
-+
-+	/* 
-+	 * XXX:
-+	 * (dmat->alignment < dmat->maxsize) is just a quick hack; the exact
-+	 * alignment guarantees of malloc need to be nailed down, and the
-+	 * code below should be rewritten to take that into account.
-+	 *
-+	 * In the meantime, we'll warn the user if malloc gets it wrong.
-+	 */
-+	if ((dmat->common.maxsize <= PAGE_SIZE) &&
-+	   (dmat->common.alignment < dmat->common.maxsize) &&
-+	    dmat->common.lowaddr >= ptoa((vm_paddr_t)Maxmem) &&
-+	    attr == VM_MEMATTR_DEFAULT) {
-+		*vaddr = malloc(dmat->common.maxsize, M_DEVBUF, mflags);
-+	} else if (dmat->common.nsegments >= btoc(dmat->common.maxsize) &&
-+	    dmat->common.alignment <= PAGE_SIZE &&
-+	    (dmat->common.boundary == 0 ||
-+	    dmat->common.boundary >= dmat->common.lowaddr)) {
-+		/* Page-based multi-segment allocations allowed */
-+		*vaddr = (void *)kmem_alloc_attr(kernel_arena,
-+		    dmat->common.maxsize, mflags, 0ul, dmat->common.lowaddr,
-+		    attr);
-+		dmat->bounce_flags |= BUS_DMA_KMEM_ALLOC;
-+	} else {
-+		*vaddr = (void *)kmem_alloc_contig(kernel_arena,
-+		    dmat->common.maxsize, mflags, 0ul, dmat->common.lowaddr,
-+		    dmat->common.alignment != 0 ? dmat->common.alignment : 1ul,
-+		    dmat->common.boundary, attr);
-+		dmat->bounce_flags |= BUS_DMA_KMEM_ALLOC;
-+	}
-+	if (*vaddr == NULL) {
-+		CTR4(KTR_BUSDMA, "%s: tag %p tag flags 0x%x error %d",
-+		    __func__, dmat, dmat->common.flags, ENOMEM);
-+		return (ENOMEM);
-+	} else if (vtophys(*vaddr) & (dmat->common.alignment - 1)) {
-+		printf("bus_dmamem_alloc failed to align memory properly.\n");
-+	}
-+	CTR4(KTR_BUSDMA, "%s: tag %p tag flags 0x%x error %d",
-+	    __func__, dmat, dmat->common.flags, 0);
-+	return (0);
-+}
-+
-+/*
-+ * Free a piece of memory and it's allociated dmamap, that was allocated
-+ * via bus_dmamem_alloc.  Make the same choice for free/contigfree.
-+ */
-+static void
-+bounce_bus_dmamem_free(bus_dma_tag_t dmat, void *vaddr, bus_dmamap_t map)
-+{
-+	/*
-+	 * dmamem does not need to be bounced, so the map should be
-+	 * NULL and the BUS_DMA_KMEM_ALLOC flag cleared if malloc()
-+	 * was used and set if kmem_alloc_contig() was used.
-+	 */
-+	if (map != NULL)
-+		panic("bus_dmamem_free: Invalid map freed\n");
-+	if ((dmat->bounce_flags & BUS_DMA_KMEM_ALLOC) == 0)
-+		free(vaddr, M_DEVBUF);
-+	else
-+		kmem_free(kernel_arena, (vm_offset_t)vaddr,
-+		    dmat->common.maxsize);
-+	CTR3(KTR_BUSDMA, "%s: tag %p flags 0x%x", __func__, dmat,
-+	    dmat->bounce_flags);
-+}
-+
-+static void
-+_bus_dmamap_count_phys(bus_dma_tag_t dmat, bus_dmamap_t map, vm_paddr_t buf,
-+    bus_size_t buflen, int flags)
-+{
-+	bus_addr_t curaddr;
-+	bus_size_t sgsize;
-+
-+	if ((map != &nobounce_dmamap && map->pagesneeded == 0)) {
-+		/*
-+		 * Count the number of bounce pages
-+		 * needed in order to complete this transfer
-+		 */
-+		curaddr = buf;
-+		while (buflen != 0) {
-+			sgsize = MIN(buflen, dmat->common.maxsegsz);
-+			if (bus_dma_run_filter(&dmat->common, curaddr)) {
-+				sgsize = MIN(sgsize, PAGE_SIZE);
-+				map->pagesneeded++;
-+			}
-+			curaddr += sgsize;
-+			buflen -= sgsize;
-+		}
-+		CTR1(KTR_BUSDMA, "pagesneeded= %d\n", map->pagesneeded);
-+	}
-+}
-+
-+static void
-+_bus_dmamap_count_pages(bus_dma_tag_t dmat, bus_dmamap_t map, pmap_t pmap,
-+    void *buf, bus_size_t buflen, int flags)
-+{
-+	vm_offset_t vaddr;
-+	vm_offset_t vendaddr;
-+	bus_addr_t paddr;
-+	bus_size_t sg_len;
-+
-+	if ((map != &nobounce_dmamap && map->pagesneeded == 0)) {
-+		CTR4(KTR_BUSDMA, "lowaddr= %d Maxmem= %d, boundary= %d, "
-+		    "alignment= %d", dmat->common.lowaddr,
-+		    ptoa((vm_paddr_t)Maxmem),
-+		    dmat->common.boundary, dmat->common.alignment);
-+		CTR3(KTR_BUSDMA, "map= %p, nobouncemap= %p, pagesneeded= %d",
-+		    map, &nobounce_dmamap, map->pagesneeded);
-+		/*
-+		 * Count the number of bounce pages
-+		 * needed in order to complete this transfer
-+		 */
-+		vaddr = (vm_offset_t)buf;
-+		vendaddr = (vm_offset_t)buf + buflen;
-+
-+		while (vaddr < vendaddr) {
-+			sg_len = PAGE_SIZE - ((vm_offset_t)vaddr & PAGE_MASK);
-+			if (pmap == kernel_pmap)
-+				paddr = pmap_kextract(vaddr);
-+			else
-+				paddr = pmap_extract(pmap, vaddr);
-+			if (bus_dma_run_filter(&dmat->common, paddr) != 0) {
-+				sg_len = roundup2(sg_len,
-+				    dmat->common.alignment);
-+				map->pagesneeded++;
-+			}
-+			vaddr += sg_len;
-+		}
-+		CTR1(KTR_BUSDMA, "pagesneeded= %d\n", map->pagesneeded);
-+	}
-+}
-+
-+static int
-+_bus_dmamap_reserve_pages(bus_dma_tag_t dmat, bus_dmamap_t map, int flags)
-+{
-+
-+	/* Reserve Necessary Bounce Pages */
-+	mtx_lock(&bounce_lock);
-+	if (flags & BUS_DMA_NOWAIT) {
-+		if (reserve_bounce_pages(dmat, map, 0) != 0) {
-+			mtx_unlock(&bounce_lock);
-+			return (ENOMEM);
-+		}
-+	} else {
-+		if (reserve_bounce_pages(dmat, map, 1) != 0) {
-+			/* Queue us for resources */
-+			STAILQ_INSERT_TAIL(&bounce_map_waitinglist, map, links);
-+			mtx_unlock(&bounce_lock);
-+			return (EINPROGRESS);
-+		}
-+	}
-+	mtx_unlock(&bounce_lock);
-+
-+	return (0);
-+}
-+
-+/*
-+ * Add a single contiguous physical range to the segment list.
-+ */
-+static int
-+_bus_dmamap_addseg(bus_dma_tag_t dmat, bus_dmamap_t map, bus_addr_t curaddr,
-+    bus_size_t sgsize, bus_dma_segment_t *segs, int *segp)
-+{
-+	bus_addr_t baddr, bmask;
-+	int seg;
-+
-+	/*
-+	 * Make sure we don't cross any boundaries.
-+	 */
-+	bmask = ~(dmat->common.boundary - 1);
-+	if (dmat->common.boundary > 0) {
-+		baddr = (curaddr + dmat->common.boundary) & bmask;
-+		if (sgsize > (baddr - curaddr))
-+			sgsize = (baddr - curaddr);
-+	}
-+
-+	/*
-+	 * Insert chunk into a segment, coalescing with
-+	 * previous segment if possible.
-+	 */
-+	seg = *segp;
-+	if (seg == -1) {
-+		seg = 0;
-+		segs[seg].ds_addr = curaddr;
-+		segs[seg].ds_len = sgsize;
-+	} else {
-+		if (curaddr == segs[seg].ds_addr + segs[seg].ds_len &&
-+		    (segs[seg].ds_len + sgsize) <= dmat->common.maxsegsz &&
-+		    (dmat->common.boundary == 0 ||
-+		     (segs[seg].ds_addr & bmask) == (curaddr & bmask)))
-+			segs[seg].ds_len += sgsize;
-+		else {
-+			if (++seg >= dmat->common.nsegments)
-+				return (0);
-+			segs[seg].ds_addr = curaddr;
-+			segs[seg].ds_len = sgsize;
-+		}
-+	}
-+	*segp = seg;
-+	return (sgsize);
-+}
-+
-+/*
-+ * Utility function to load a physical buffer.  segp contains
-+ * the starting segment on entrace, and the ending segment on exit.
-+ */
-+static int
-+bounce_bus_dmamap_load_phys(bus_dma_tag_t dmat, bus_dmamap_t map,
-+    vm_paddr_t buf, bus_size_t buflen, int flags, bus_dma_segment_t *segs,
-+    int *segp)
-+{
-+	bus_size_t sgsize;
-+	bus_addr_t curaddr;
-+	int error;
-+
-+	if (map == NULL)
-+		map = &nobounce_dmamap;
-+
-+	if (segs == NULL)
-+		segs = dmat->segments;
-+
-+	if ((dmat->bounce_flags & BUS_DMA_COULD_BOUNCE) != 0) {
-+		_bus_dmamap_count_phys(dmat, map, buf, buflen, flags);
-+		if (map->pagesneeded != 0) {
-+			error = _bus_dmamap_reserve_pages(dmat, map, flags);
-+			if (error)
-+				return (error);
-+		}
-+	}
-+
-+	while (buflen > 0) {
-+		curaddr = buf;
-+		sgsize = MIN(buflen, dmat->common.maxsegsz);
-+		if (((dmat->bounce_flags & BUS_DMA_COULD_BOUNCE) != 0) &&
-+		    map->pagesneeded != 0 &&
-+		    bus_dma_run_filter(&dmat->common, curaddr)) {
-+			sgsize = MIN(sgsize, PAGE_SIZE);
-+			curaddr = add_bounce_page(dmat, map, 0, curaddr,
-+			    sgsize);
-+		}
-+		sgsize = _bus_dmamap_addseg(dmat, map, curaddr, sgsize, segs,
-+		    segp);
-+		if (sgsize == 0)
-+			break;
-+		buf += sgsize;
-+		buflen -= sgsize;
-+	}
-+
-+	/*
-+	 * Did we fit?
-+	 */
-+	return (buflen != 0 ? EFBIG : 0); /* XXX better return value here? */
-+}
-+
-+/*
-+ * Utility function to load a linear buffer.  segp contains
-+ * the starting segment on entrace, and the ending segment on exit.
-+ */
-+static int
-+bounce_bus_dmamap_load_buffer(bus_dma_tag_t dmat, bus_dmamap_t map, void *buf,
-+    bus_size_t buflen, pmap_t pmap, int flags, bus_dma_segment_t *segs,
-+    int *segp)
-+{
-+	bus_size_t sgsize, max_sgsize;
-+	bus_addr_t curaddr;
-+	vm_offset_t vaddr;
-+	int error;
-+
-+	if (map == NULL)
-+		map = &nobounce_dmamap;
-+
-+	if (segs == NULL)
-+		segs = dmat->segments;
-+
-+	if ((dmat->bounce_flags & BUS_DMA_COULD_BOUNCE) != 0) {
-+		_bus_dmamap_count_pages(dmat, map, pmap, buf, buflen, flags);
-+		if (map->pagesneeded != 0) {
-+			error = _bus_dmamap_reserve_pages(dmat, map, flags);
-+			if (error)
-+				return (error);
-+		}
-+	}
-+
-+	vaddr = (vm_offset_t)buf;
-+	while (buflen > 0) {
-+		/*
-+		 * Get the physical address for this segment.
-+		 */
-+		if (pmap == kernel_pmap)
-+			curaddr = pmap_kextract(vaddr);
-+		else
-+			curaddr = pmap_extract(pmap, vaddr);
-+
-+		/*
-+		 * Compute the segment size, and adjust counts.
-+		 */
-+		max_sgsize = MIN(buflen, dmat->common.maxsegsz);
-+		sgsize = PAGE_SIZE - ((vm_offset_t)curaddr & PAGE_MASK);
-+		if (((dmat->bounce_flags & BUS_DMA_COULD_BOUNCE) != 0) &&
-+		    map->pagesneeded != 0 &&
-+		    bus_dma_run_filter(&dmat->common, curaddr)) {
-+			sgsize = roundup2(sgsize, dmat->common.alignment);
-+			sgsize = MIN(sgsize, max_sgsize);
-+			curaddr = add_bounce_page(dmat, map, vaddr, curaddr,
-+			    sgsize);
-+		} else {
-+			sgsize = MIN(sgsize, max_sgsize);
-+		}
-+		sgsize = _bus_dmamap_addseg(dmat, map, curaddr, sgsize, segs,
-+		    segp);
-+		if (sgsize == 0)
-+			break;
-+		vaddr += sgsize;
-+		buflen -= sgsize;
-+	}
-+
-+	/*
-+	 * Did we fit?
-+	 */
-+	return (buflen != 0 ? EFBIG : 0); /* XXX better return value here? */
-+}
-+
-+static void
-+bounce_bus_dmamap_waitok(bus_dma_tag_t dmat, bus_dmamap_t map,
-+    struct memdesc *mem, bus_dmamap_callback_t *callback, void *callback_arg)
-+{
-+
-+	if (map == NULL)
-+		return;
-+	map->mem = *mem;
-+	map->dmat = dmat;
-+	map->callback = callback;
-+	map->callback_arg = callback_arg;
-+}
-+
-+static bus_dma_segment_t *
-+bounce_bus_dmamap_complete(bus_dma_tag_t dmat, bus_dmamap_t map,
-+    bus_dma_segment_t *segs, int nsegs, int error)
-+{
-+
-+	if (segs == NULL)
-+		segs = dmat->segments;
-+	return (segs);
-+}
-+
-+/*
-+ * Release the mapping held by map.
-+ */
-+static void
-+bounce_bus_dmamap_unload(bus_dma_tag_t dmat, bus_dmamap_t map)
-+{
-+	struct bounce_page *bpage;
-+
-+	while ((bpage = STAILQ_FIRST(&map->bpages)) != NULL) {
-+		STAILQ_REMOVE_HEAD(&map->bpages, links);
-+		free_bounce_page(dmat, bpage);
-+	}
-+}
-+
-+static void
-+bounce_bus_dmamap_sync(bus_dma_tag_t dmat, bus_dmamap_t map,
-+    bus_dmasync_op_t op)
-+{
-+	struct bounce_page *bpage;
-+
-+	/*
-+	 * XXX ARM64TODO:
-+	 * This bus_dma implementation requires IO-Coherent architecutre.
-+	 * If IO-Coherency is not guaranteed, cache operations have to be
-+	 * added to this function.
-+	 */
-+
-+	if ((bpage = STAILQ_FIRST(&map->bpages)) != NULL) {
-+		/*
-+		 * Handle data bouncing.  We might also
-+		 * want to add support for invalidating
-+		 * the caches on broken hardware
-+		 */
-+		CTR4(KTR_BUSDMA, "%s: tag %p tag flags 0x%x op 0x%x "
-+		    "performing bounce", __func__, dmat,
-+		    dmat->common.flags, op);
-+
-+		if ((op & BUS_DMASYNC_PREWRITE) != 0) {
-+			while (bpage != NULL) {
-+				if (bpage->datavaddr != 0) {
-+					bcopy((void *)bpage->datavaddr,
-+					    (void *)bpage->vaddr,
-+					    bpage->datacount);
-+				} else {
-+					physcopyout(bpage->dataaddr,
-+					    (void *)bpage->vaddr,
-+					    bpage->datacount);
-+				}
-+				bpage = STAILQ_NEXT(bpage, links);
-+			}
-+			dmat->bounce_zone->total_bounced++;
-+		}
-+
-+		if ((op & BUS_DMASYNC_POSTREAD) != 0) {
-+			while (bpage != NULL) {
-+				if (bpage->datavaddr != 0) {
-+					bcopy((void *)bpage->vaddr,
-+					    (void *)bpage->datavaddr,
-+					    bpage->datacount);
-+				} else {
-+					physcopyin((void *)bpage->vaddr,
-+					    bpage->dataaddr,
-+					    bpage->datacount);
-+				}
-+				bpage = STAILQ_NEXT(bpage, links);
-+			}
-+			dmat->bounce_zone->total_bounced++;
-+		}
-+	}
-+}
-+
-+static void
-+init_bounce_pages(void *dummy __unused)
-+{
-+
-+	total_bpages = 0;
-+	STAILQ_INIT(&bounce_zone_list);
-+	STAILQ_INIT(&bounce_map_waitinglist);
-+	STAILQ_INIT(&bounce_map_callbacklist);
-+	mtx_init(&bounce_lock, "bounce pages lock", NULL, MTX_DEF);
-+}
-+SYSINIT(bpages, SI_SUB_LOCK, SI_ORDER_ANY, init_bounce_pages, NULL);
-+
-+static struct sysctl_ctx_list *
-+busdma_sysctl_tree(struct bounce_zone *bz)
-+{
-+	return (&bz->sysctl_tree);
-+}
-+
-+static struct sysctl_oid *
-+busdma_sysctl_tree_top(struct bounce_zone *bz)
-+{
-+	return (bz->sysctl_tree_top);
-+}
-+
-+static int
-+alloc_bounce_zone(bus_dma_tag_t dmat)
-+{
-+	struct bounce_zone *bz;
-+
-+	/* Check to see if we already have a suitable zone */
-+	STAILQ_FOREACH(bz, &bounce_zone_list, links) {
-+		if ((dmat->common.alignment <= bz->alignment) &&
-+		    (dmat->common.lowaddr >= bz->lowaddr)) {
-+			dmat->bounce_zone = bz;
-+			return (0);
-+		}
-+	}
-+
-+	if ((bz = (struct bounce_zone *)malloc(sizeof(*bz), M_DEVBUF,
-+	    M_NOWAIT | M_ZERO)) == NULL)
-+		return (ENOMEM);
-+
-+	STAILQ_INIT(&bz->bounce_page_list);
-+	bz->free_bpages = 0;
-+	bz->reserved_bpages = 0;
-+	bz->active_bpages = 0;
-+	bz->lowaddr = dmat->common.lowaddr;
-+	bz->alignment = MAX(dmat->common.alignment, PAGE_SIZE);
-+	bz->map_count = 0;
-+	snprintf(bz->zoneid, 8, "zone%d", busdma_zonecount);
-+	busdma_zonecount++;
-+	snprintf(bz->lowaddrid, 18, "%#jx", (uintmax_t)bz->lowaddr);
-+	STAILQ_INSERT_TAIL(&bounce_zone_list, bz, links);
-+	dmat->bounce_zone = bz;
-+
-+	sysctl_ctx_init(&bz->sysctl_tree);
-+	bz->sysctl_tree_top = SYSCTL_ADD_NODE(&bz->sysctl_tree,
-+	    SYSCTL_STATIC_CHILDREN(_hw_busdma), OID_AUTO, bz->zoneid,
-+	    CTLFLAG_RD, 0, "");
-+	if (bz->sysctl_tree_top == NULL) {
-+		sysctl_ctx_free(&bz->sysctl_tree);
-+		return (0);	/* XXX error code? */
-+	}
-+
-+	SYSCTL_ADD_INT(busdma_sysctl_tree(bz),
-+	    SYSCTL_CHILDREN(busdma_sysctl_tree_top(bz)), OID_AUTO,
-+	    "total_bpages", CTLFLAG_RD, &bz->total_bpages, 0,
-+	    "Total bounce pages");
-+	SYSCTL_ADD_INT(busdma_sysctl_tree(bz),
-+	    SYSCTL_CHILDREN(busdma_sysctl_tree_top(bz)), OID_AUTO,
-+	    "free_bpages", CTLFLAG_RD, &bz->free_bpages, 0,
-+	    "Free bounce pages");
-+	SYSCTL_ADD_INT(busdma_sysctl_tree(bz),
-+	    SYSCTL_CHILDREN(busdma_sysctl_tree_top(bz)), OID_AUTO,
-+	    "reserved_bpages", CTLFLAG_RD, &bz->reserved_bpages, 0,
-+	    "Reserved bounce pages");
-+	SYSCTL_ADD_INT(busdma_sysctl_tree(bz),
-+	    SYSCTL_CHILDREN(busdma_sysctl_tree_top(bz)), OID_AUTO,
-+	    "active_bpages", CTLFLAG_RD, &bz->active_bpages, 0,
-+	    "Active bounce pages");
-+	SYSCTL_ADD_INT(busdma_sysctl_tree(bz),
-+	    SYSCTL_CHILDREN(busdma_sysctl_tree_top(bz)), OID_AUTO,
-+	    "total_bounced", CTLFLAG_RD, &bz->total_bounced, 0,
-+	    "Total bounce requests");
-+	SYSCTL_ADD_INT(busdma_sysctl_tree(bz),
-+	    SYSCTL_CHILDREN(busdma_sysctl_tree_top(bz)), OID_AUTO,
-+	    "total_deferred", CTLFLAG_RD, &bz->total_deferred, 0,
-+	    "Total bounce requests that were deferred");
-+	SYSCTL_ADD_STRING(busdma_sysctl_tree(bz),
-+	    SYSCTL_CHILDREN(busdma_sysctl_tree_top(bz)), OID_AUTO,
-+	    "lowaddr", CTLFLAG_RD, bz->lowaddrid, 0, "");
-+	SYSCTL_ADD_UAUTO(busdma_sysctl_tree(bz),
-+	    SYSCTL_CHILDREN(busdma_sysctl_tree_top(bz)), OID_AUTO,
-+	    "alignment", CTLFLAG_RD, &bz->alignment, "");
-+
-+	return (0);
-+}
-+
-+static int
-+alloc_bounce_pages(bus_dma_tag_t dmat, u_int numpages)
-+{
-+	struct bounce_zone *bz;
-+	int count;
-+
-+	bz = dmat->bounce_zone;
-+	count = 0;
-+	while (numpages > 0) {
-+		struct bounce_page *bpage;
-+
-+		bpage = (struct bounce_page *)malloc(sizeof(*bpage), M_DEVBUF,
-+						     M_NOWAIT | M_ZERO);
-+
-+		if (bpage == NULL)
-+			break;
-+		bpage->vaddr = (vm_offset_t)contigmalloc(PAGE_SIZE, M_DEVBUF,
-+							 M_NOWAIT, 0ul,
-+							 bz->lowaddr,
-+							 PAGE_SIZE,
-+							 0);
-+		if (bpage->vaddr == 0) {
-+			free(bpage, M_DEVBUF);
-+			break;
-+		}
-+		bpage->busaddr = pmap_kextract(bpage->vaddr);
-+		mtx_lock(&bounce_lock);
-+		STAILQ_INSERT_TAIL(&bz->bounce_page_list, bpage, links);
-+		total_bpages++;
-+		bz->total_bpages++;
-+		bz->free_bpages++;
-+		mtx_unlock(&bounce_lock);
-+		count++;
-+		numpages--;
-+	}
-+	return (count);
-+}
-+
-+static int
-+reserve_bounce_pages(bus_dma_tag_t dmat, bus_dmamap_t map, int commit)
-+{
-+	struct bounce_zone *bz;
-+	int pages;
-+
-+	mtx_assert(&bounce_lock, MA_OWNED);
-+	bz = dmat->bounce_zone;
-+	pages = MIN(bz->free_bpages, map->pagesneeded - map->pagesreserved);
-+	if (commit == 0 && map->pagesneeded > (map->pagesreserved + pages))
-+		return (map->pagesneeded - (map->pagesreserved + pages));
-+	bz->free_bpages -= pages;
-+	bz->reserved_bpages += pages;
-+	map->pagesreserved += pages;
-+	pages = map->pagesneeded - map->pagesreserved;
-+
-+	return (pages);
-+}
-+
-+static bus_addr_t
-+add_bounce_page(bus_dma_tag_t dmat, bus_dmamap_t map, vm_offset_t vaddr,
-+		bus_addr_t addr, bus_size_t size)
-+{
-+	struct bounce_zone *bz;
-+	struct bounce_page *bpage;
-+
-+	KASSERT(dmat->bounce_zone != NULL, ("no bounce zone in dma tag"));
-+	KASSERT(map != NULL && map != &nobounce_dmamap,
-+	    ("add_bounce_page: bad map %p", map));
-+
-+	bz = dmat->bounce_zone;
-+	if (map->pagesneeded == 0)
-+		panic("add_bounce_page: map doesn't need any pages");
-+	map->pagesneeded--;
-+
-+	if (map->pagesreserved == 0)
-+		panic("add_bounce_page: map doesn't need any pages");
-+	map->pagesreserved--;
-+
-+	mtx_lock(&bounce_lock);
-+	bpage = STAILQ_FIRST(&bz->bounce_page_list);
-+	if (bpage == NULL)
-+		panic("add_bounce_page: free page list is empty");
-+
-+	STAILQ_REMOVE_HEAD(&bz->bounce_page_list, links);
-+	bz->reserved_bpages--;
-+	bz->active_bpages++;
-+	mtx_unlock(&bounce_lock);
-+
-+	if (dmat->common.flags & BUS_DMA_KEEP_PG_OFFSET) {
-+		/* Page offset needs to be preserved. */
-+		bpage->vaddr |= vaddr & PAGE_MASK;
-+		bpage->busaddr |= vaddr & PAGE_MASK;
-+	}
-+	bpage->datavaddr = vaddr;
-+	bpage->dataaddr = addr;
-+	bpage->datacount = size;
-+	STAILQ_INSERT_TAIL(&(map->bpages), bpage, links);
-+	return (bpage->busaddr);
-+}
-+
-+static void
-+free_bounce_page(bus_dma_tag_t dmat, struct bounce_page *bpage)
-+{
-+	struct bus_dmamap *map;
-+	struct bounce_zone *bz;
-+
-+	bz = dmat->bounce_zone;
-+	bpage->datavaddr = 0;
-+	bpage->datacount = 0;
-+	if (dmat->common.flags & BUS_DMA_KEEP_PG_OFFSET) {
-+		/*
-+		 * Reset the bounce page to start at offset 0.  Other uses
-+		 * of this bounce page may need to store a full page of
-+		 * data and/or assume it starts on a page boundary.
-+		 */
-+		bpage->vaddr &= ~PAGE_MASK;
-+		bpage->busaddr &= ~PAGE_MASK;
-+	}
-+
-+	mtx_lock(&bounce_lock);
-+	STAILQ_INSERT_HEAD(&bz->bounce_page_list, bpage, links);
-+	bz->free_bpages++;
-+	bz->active_bpages--;
-+	if ((map = STAILQ_FIRST(&bounce_map_waitinglist)) != NULL) {
-+		if (reserve_bounce_pages(map->dmat, map, 1) == 0) {
-+			STAILQ_REMOVE_HEAD(&bounce_map_waitinglist, links);
-+			STAILQ_INSERT_TAIL(&bounce_map_callbacklist,
-+			    map, links);
-+			busdma_swi_pending = 1;
-+			bz->total_deferred++;
-+			swi_sched(vm_ih, 0);
-+		}
-+	}
-+	mtx_unlock(&bounce_lock);
-+}
-+
-+void
-+busdma_swi(void)
-+{
-+	bus_dma_tag_t dmat;
-+	struct bus_dmamap *map;
-+
-+	mtx_lock(&bounce_lock);
-+	while ((map = STAILQ_FIRST(&bounce_map_callbacklist)) != NULL) {
-+		STAILQ_REMOVE_HEAD(&bounce_map_callbacklist, links);
-+		mtx_unlock(&bounce_lock);
-+		dmat = map->dmat;
-+		(dmat->common.lockfunc)(dmat->common.lockfuncarg, BUS_DMA_LOCK);
-+		bus_dmamap_load_mem(map->dmat, map, &map->mem,
-+		    map->callback, map->callback_arg, BUS_DMA_WAITOK);
-+		(dmat->common.lockfunc)(dmat->common.lockfuncarg,
-+		    BUS_DMA_UNLOCK);
-+		mtx_lock(&bounce_lock);
-+	}
-+	mtx_unlock(&bounce_lock);
-+}
-+
-+struct bus_dma_impl bus_dma_bounce_impl = {
-+	.tag_create = bounce_bus_dma_tag_create,
-+	.tag_destroy = bounce_bus_dma_tag_destroy,
-+	.map_create = bounce_bus_dmamap_create,
-+	.map_destroy = bounce_bus_dmamap_destroy,
-+	.mem_alloc = bounce_bus_dmamem_alloc,
-+	.mem_free = bounce_bus_dmamem_free,
-+	.load_phys = bounce_bus_dmamap_load_phys,
-+	.load_buffer = bounce_bus_dmamap_load_buffer,
-+	.load_ma = bus_dmamap_load_ma_triv,
-+	.map_waitok = bounce_bus_dmamap_waitok,
-+	.map_complete = bounce_bus_dmamap_complete,
-+	.map_unload = bounce_bus_dmamap_unload,
-+	.map_sync = bounce_bus_dmamap_sync
-+};
-
-Property changes on: sys/arm64/arm64/busdma_bounce.c
-___________________________________________________________________
-Added: svn:mime-type
-## -0,0 +1 ##
-+text/plain
-\ No newline at end of property
-Added: svn:keywords
-## -0,0 +1 ##
-+FreeBSD=%H
-\ No newline at end of property
-Added: svn:eol-style
-## -0,0 +1 ##
-+native
-\ No newline at end of property
-Index: sys/arm64/arm64/busdma_machdep.c
-===================================================================
---- sys/arm64/arm64/busdma_machdep.c	(revision 282200)
-+++ sys/arm64/arm64/busdma_machdep.c	(working copy)
-@@ -1,4 +1,35 @@
--/* $FreeBSD$ */
-+/*-
-+ * Copyright (c) 1997, 1998 Justin T. Gibbs.
-+ * Copyright (c) 2013, 2015 The FreeBSD Foundation
-+ * All rights reserved.
-+ *
-+ * This software was developed by Konstantin Belousov <kib@FreeBSD.org>
-+ * under sponsorship from the FreeBSD Foundation.
-+ *
-+ * Portions of this software were developed by Semihalf
-+ * under sponsorship of the FreeBSD Foundation.
-+ *
-+ * Redistribution and use in source and binary forms, with or without
-+ * modification, are permitted provided that the following conditions
-+ * are met:
-+ * 1. Redistributions of source code must retain the above copyright
-+ *    notice, this list of conditions, and the following disclaimer,
-+ *    without modification, immediately at the beginning of the file.
-+ * 2. The name of the author may not be used to endorse or promote products
-+ *    derived from this software without specific prior written permission.
-+ *
-+ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
-+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
-+ * ARE DISCLAIMED. IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE FOR
-+ * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
-+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
-+ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
-+ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
-+ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
-+ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
-+ * SUCH DAMAGE.
-+ */
- 
- #include <sys/cdefs.h>
- __FBSDID("$FreeBSD$");
-@@ -5,18 +36,257 @@
- 
- #include <sys/param.h>
- #include <sys/systm.h>
--
-+#include <sys/malloc.h>
-+#include <sys/bus.h>
-+#include <sys/kernel.h>
-+#include <sys/ktr.h>
-+#include <sys/lock.h>
-+#include <sys/memdesc.h>
-+#include <sys/mutex.h>
-+#include <sys/uio.h>
- #include <vm/vm.h>
-+#include <vm/vm_extern.h>
- #include <vm/pmap.h>
- 
- #include <machine/bus.h>
-+#include <arm64/include/bus_dma_impl.h>
- 
-+/*
-+ * Convenience function for manipulating driver locks from busdma (during
-+ * busdma_swi, for example).  Drivers that don't provide their own locks
-+ * should specify &Giant to dmat->lockfuncarg.  Drivers that use their own
-+ * non-mutex locking scheme don't have to use this at all.
-+ */
-+void
-+busdma_lock_mutex(void *arg, bus_dma_lock_op_t op)
-+{
-+	struct mtx *dmtx;
-+
-+	dmtx = (struct mtx *)arg;
-+	switch (op) {
-+	case BUS_DMA_LOCK:
-+		mtx_lock(dmtx);
-+		break;
-+	case BUS_DMA_UNLOCK:
-+		mtx_unlock(dmtx);
-+		break;
-+	default:
-+		panic("Unknown operation 0x%x for busdma_lock_mutex!", op);
-+	}
-+}
-+
-+/*
-+ * dflt_lock should never get called.  It gets put into the dma tag when
-+ * lockfunc == NULL, which is only valid if the maps that are associated
-+ * with the tag are meant to never be defered.
-+ * XXX Should have a way to identify which driver is responsible here.
-+ */
-+void
-+bus_dma_dflt_lock(void *arg, bus_dma_lock_op_t op)
-+{
-+
-+	panic("driver error: busdma dflt_lock called");
-+}
-+
-+/*
-+ * Return true if a match is made.
-+ *
-+ * To find a match walk the chain of bus_dma_tag_t's looking for 'paddr'.
-+ *
-+ * If paddr is within the bounds of the dma tag then call the filter callback
-+ * to check for a match, if there is no filter callback then assume a match.
-+ */
- int
-+bus_dma_run_filter(struct bus_dma_tag_common *tc, bus_addr_t paddr)
-+{
-+	int retval;
-+
-+	retval = 0;
-+	do {
-+		if (((paddr > tc->lowaddr && paddr <= tc->highaddr) ||
-+		    ((paddr & (tc->alignment - 1)) != 0)) &&
-+		    (tc->filter == NULL ||
-+		    (*tc->filter)(tc->filterarg, paddr) != 0))
-+			retval = 1;
-+
-+		tc = tc->parent;		
-+	} while (retval == 0 && tc != NULL);
-+	return (retval);
-+}
-+
-+int
-+common_bus_dma_tag_create(struct bus_dma_tag_common *parent,
-+    bus_size_t alignment, bus_addr_t boundary, bus_addr_t lowaddr,
-+    bus_addr_t highaddr, bus_dma_filter_t *filter, void *filterarg,
-+    bus_size_t maxsize, int nsegments, bus_size_t maxsegsz, int flags,
-+    bus_dma_lock_t *lockfunc, void *lockfuncarg, size_t sz, void **dmat)
-+{
-+	void *newtag;
-+	struct bus_dma_tag_common *common;
-+
-+	KASSERT(sz >= sizeof(struct bus_dma_tag_common), ("sz"));
-+	/* Basic sanity checking */
-+	if (boundary != 0 && boundary < maxsegsz)
-+		maxsegsz = boundary;
-+	if (maxsegsz == 0)
-+		return (EINVAL);
-+	/* Return a NULL tag on failure */
-+	*dmat = NULL;
-+
-+	newtag = malloc(sz, M_DEVBUF, M_ZERO | M_NOWAIT);
-+	if (newtag == NULL) {
-+		CTR4(KTR_BUSDMA, "%s returned tag %p tag flags 0x%x error %d",
-+		    __func__, newtag, 0, ENOMEM);
-+		return (ENOMEM);
-+	}
-+
-+	common = newtag;
-+	common->impl = &bus_dma_bounce_impl;
-+	common->parent = parent;
-+	common->alignment = alignment;
-+	common->boundary = boundary;
-+	common->lowaddr = trunc_page((vm_paddr_t)lowaddr) + (PAGE_SIZE - 1);
-+	common->highaddr = trunc_page((vm_paddr_t)highaddr) + (PAGE_SIZE - 1);
-+	common->filter = filter;
-+	common->filterarg = filterarg;
-+	common->maxsize = maxsize;
-+	common->nsegments = nsegments;
-+	common->maxsegsz = maxsegsz;
-+	common->flags = flags;
-+	common->ref_count = 1; /* Count ourself */
-+	if (lockfunc != NULL) {
-+		common->lockfunc = lockfunc;
-+		common->lockfuncarg = lockfuncarg;
-+	} else {
-+		common->lockfunc = bus_dma_dflt_lock;
-+		common->lockfuncarg = NULL;
-+	}
-+
-+	/* Take into account any restrictions imposed by our parent tag */
-+	if (parent != NULL) {
-+		common->impl = parent->impl;
-+		common->lowaddr = MIN(parent->lowaddr, common->lowaddr);
-+		common->highaddr = MAX(parent->highaddr, common->highaddr);
-+		if (common->boundary == 0)
-+			common->boundary = parent->boundary;
-+		else if (parent->boundary != 0) {
-+			common->boundary = MIN(parent->boundary,
-+			    common->boundary);
-+		}
-+		if (common->filter == NULL) {
-+			/*
-+			 * Short circuit looking at our parent directly
-+			 * since we have encapsulated all of its information
-+			 */
-+			common->filter = parent->filter;
-+			common->filterarg = parent->filterarg;
-+			common->parent = parent->parent;
-+		}
-+		atomic_add_int(&parent->ref_count, 1);
-+	}
-+	*dmat = common;
-+	return (0);
-+}
-+
-+/*
-+ * Allocate a device specific dma_tag.
-+ */
-+int
-+bus_dma_tag_create(bus_dma_tag_t parent, bus_size_t alignment,
-+    bus_addr_t boundary, bus_addr_t lowaddr, bus_addr_t highaddr,
-+    bus_dma_filter_t *filter, void *filterarg, bus_size_t maxsize,
-+    int nsegments, bus_size_t maxsegsz, int flags, bus_dma_lock_t *lockfunc,
-+    void *lockfuncarg, bus_dma_tag_t *dmat)
-+{
-+	struct bus_dma_tag_common *tc;
-+	int error;
-+
-+	if (parent == NULL) {
-+		error = bus_dma_bounce_impl.tag_create(parent, alignment,
-+		    boundary, lowaddr, highaddr, filter, filterarg, maxsize,
-+		    nsegments, maxsegsz, flags, lockfunc, lockfuncarg, dmat);
-+	} else {
-+		tc = (struct bus_dma_tag_common *)parent;
-+		error = tc->impl->tag_create(parent, alignment,
-+		    boundary, lowaddr, highaddr, filter, filterarg, maxsize,
-+		    nsegments, maxsegsz, flags, lockfunc, lockfuncarg, dmat);
-+	}
-+	return (error);
-+}
-+
-+int
-+bus_dma_tag_destroy(bus_dma_tag_t dmat)
-+{
-+	struct bus_dma_tag_common *tc;
-+
-+	tc = (struct bus_dma_tag_common *)dmat;
-+	return (tc->impl->tag_destroy(dmat));
-+}
-+
-+/*
-+ * Allocate a handle for mapping from kva/uva/physical
-+ * address space into bus device space.
-+ */
-+int
-+bus_dmamap_create(bus_dma_tag_t dmat, int flags, bus_dmamap_t *mapp)
-+{
-+	struct bus_dma_tag_common *tc;
-+
-+	tc = (struct bus_dma_tag_common *)dmat;
-+	return (tc->impl->map_create(dmat, flags, mapp));
-+}
-+
-+/*
-+ * Destroy a handle for mapping from kva/uva/physical
-+ * address space into bus device space.
-+ */
-+int
-+bus_dmamap_destroy(bus_dma_tag_t dmat, bus_dmamap_t map)
-+{
-+	struct bus_dma_tag_common *tc;
-+
-+	tc = (struct bus_dma_tag_common *)dmat;
-+	return (tc->impl->map_destroy(dmat, map));
-+}
-+
-+
-+/*
-+ * Allocate a piece of memory that can be efficiently mapped into
-+ * bus device space based on the constraints listed in the dma tag.
-+ * A dmamap to for use with dmamap_load is also allocated.
-+ */
-+int
-+bus_dmamem_alloc(bus_dma_tag_t dmat, void** vaddr, int flags,
-+    bus_dmamap_t *mapp)
-+{
-+	struct bus_dma_tag_common *tc;
-+
-+	tc = (struct bus_dma_tag_common *)dmat;
-+	return (tc->impl->mem_alloc(dmat, vaddr, flags, mapp));
-+}
-+
-+/*
-+ * Free a piece of memory and it's allociated dmamap, that was allocated
-+ * via bus_dmamem_alloc.  Make the same choice for free/contigfree.
-+ */
-+void
-+bus_dmamem_free(bus_dma_tag_t dmat, void *vaddr, bus_dmamap_t map)
-+{
-+	struct bus_dma_tag_common *tc;
-+
-+	tc = (struct bus_dma_tag_common *)dmat;
-+	tc->impl->mem_free(dmat, vaddr, map);
-+}
-+
-+int
- _bus_dmamap_load_phys(bus_dma_tag_t dmat, bus_dmamap_t map, vm_paddr_t buf,
-     bus_size_t buflen, int flags, bus_dma_segment_t *segs, int *segp)
- {
-+	struct bus_dma_tag_common *tc;
- 
--	panic("_bus_dmamap_load_phys");
-+	tc = (struct bus_dma_tag_common *)dmat;
-+	return (tc->impl->load_phys(dmat, map, buf, buflen, flags, segs,
-+	    segp));
- }
- 
- int
-@@ -24,8 +294,11 @@
-     bus_size_t tlen, int ma_offs, int flags, bus_dma_segment_t *segs,
-     int *segp)
- {
-+	struct bus_dma_tag_common *tc;
- 
--	panic("_bus_dmamap_load_ma");
-+	tc = (struct bus_dma_tag_common *)dmat;
-+	return (tc->impl->load_ma(dmat, map, ma, tlen, ma_offs, flags,
-+	    segs, segp));
- }
- 
- int
-@@ -33,8 +306,11 @@
-     bus_size_t buflen, pmap_t pmap, int flags, bus_dma_segment_t *segs,
-     int *segp)
- {
-+	struct bus_dma_tag_common *tc;
- 
--	panic("_bus_dmamap_load_buffer");
-+	tc = (struct bus_dma_tag_common *)dmat;
-+	return (tc->impl->load_buffer(dmat, map, buf, buflen, pmap, flags, segs,
-+	    segp));
- }
- 
- void
-@@ -41,8 +317,10 @@
- __bus_dmamap_waitok(bus_dma_tag_t dmat, bus_dmamap_t map,
-     struct memdesc *mem, bus_dmamap_callback_t *callback, void *callback_arg)
- {
-+	struct bus_dma_tag_common *tc;
- 
--	panic("__bus_dmamap_waitok");
-+	tc = (struct bus_dma_tag_common *)dmat;
-+	tc->impl->map_waitok(dmat, map, mem, callback, callback_arg);
- }
- 
- bus_dma_segment_t *
-@@ -49,20 +327,29 @@
- _bus_dmamap_complete(bus_dma_tag_t dmat, bus_dmamap_t map,
-     bus_dma_segment_t *segs, int nsegs, int error)
- {
-+	struct bus_dma_tag_common *tc;
- 
--	panic("_bus_dmamap_complete");
-+	tc = (struct bus_dma_tag_common *)dmat;
-+	return (tc->impl->map_complete(dmat, map, segs, nsegs, error));
- }
- 
-+/*
-+ * Release the mapping held by map.
-+ */
- void
- _bus_dmamap_unload(bus_dma_tag_t dmat, bus_dmamap_t map)
- {
-+	struct bus_dma_tag_common *tc;
- 
--	panic("_bus_dmamap_unload");
-+	tc = (struct bus_dma_tag_common *)dmat;
-+	tc->impl->map_unload(dmat, map);
- }
- 
- void
- _bus_dmamap_sync(bus_dma_tag_t dmat, bus_dmamap_t map, bus_dmasync_op_t op)
- {
-+	struct bus_dma_tag_common *tc;
- 
--	panic("_bus_dmamap_sync");
-+	tc = (struct bus_dma_tag_common *)dmat;
-+	tc->impl->map_sync(dmat, map, op);
- }
 Index: sys/arm64/arm64/gic.c
 ===================================================================
---- sys/arm64/arm64/gic.c	(revision 282200)
+--- sys/arm64/arm64/gic.c	(revision 282765)
 +++ sys/arm64/arm64/gic.c	(working copy)
-@@ -257,7 +257,7 @@
+@@ -257,7 +257,8 @@
  
  	/* Set all the interrupts to be in Group 0 (secure) */
  	for (i = 0; i < sc->nirqs; i += 32) {
 -		gic_d_write_4(sc, GICD_IGROUPR(i >> 5), 0);
++		/* Gem5 TODO */
 +		//gic_d_write_4(sc, GICD_IGROUPR(i >> 5), 0);
  	}
  
  	/* Enable CPU interface */
-@@ -316,7 +316,7 @@
+@@ -316,7 +317,8 @@
  	struct arm_gic_softc *sc = device_get_softc(dev);
  
  	gic_d_write_4(sc, GICD_ICENABLER(irq >> 5), (1UL << (irq & 0x1F)));
 -	gic_c_write_4(sc, GICC_EOIR, irq);
++	/* Gem5 TODO */
 +	//gic_c_write_4(sc, GICC_EOIR, irq);
  }
  
  void
 Index: sys/arm64/arm64/locore.S
 ===================================================================
---- sys/arm64/arm64/locore.S	(revision 282200)
+--- sys/arm64/arm64/locore.S	(revision 282765)
 +++ sys/arm64/arm64/locore.S	(working copy)
 @@ -288,7 +288,7 @@
  	/* Get the number of l2 pages to allocate, rounded down */
@@ -1540,7 +65,7 @@ Index: sys/arm64/arm64/locore.S
  	mov	x6, x26
 Index: sys/arm64/arm64/machdep.c
 ===================================================================
---- sys/arm64/arm64/machdep.c	(revision 282200)
+--- sys/arm64/arm64/machdep.c	(revision 282765)
 +++ sys/arm64/arm64/machdep.c	(working copy)
 @@ -807,7 +807,16 @@
  	physmap_idx = 0;
@@ -1562,18 +87,24 @@ Index: sys/arm64/arm64/machdep.c
  	mem_len = 0;
 Index: sys/arm64/conf/GENERIC
 ===================================================================
---- sys/arm64/conf/GENERIC	(revision 282200)
+--- sys/arm64/conf/GENERIC	(revision 282765)
 +++ sys/arm64/conf/GENERIC	(working copy)
-@@ -66,6 +66,8 @@
+@@ -66,8 +66,14 @@
  options 	KDTRACE_HOOKS		# Kernel DTrace hooks
  options 	VFP			# Floating-point support
  
 +options         ROOTDEVNAME=\"ufs:ada0s2\"
 +
++# Use for virtio
++# options         ROOTDEVNAME=\"ufs:vtbd0s2\"
++
  device		virtio
  device		virtio_mmio
++device		virtio_pci
  device		virtio_blk
-@@ -91,4 +93,14 @@
+ device		vtnet
+ 
+@@ -91,4 +97,14 @@
  # Note that 'bpf' is required for DHCP.
  device		bpf		# Berkeley packet filter
  
@@ -1588,164 +119,6 @@ Index: sys/arm64/conf/GENERIC
 +device		em
 +
  options 	FDT
-Index: sys/arm64/include/bus_dma.h
-===================================================================
---- sys/arm64/include/bus_dma.h	(revision 282200)
-+++ sys/arm64/include/bus_dma.h	(working copy)
-@@ -1,8 +1,34 @@
-+/*-
-+ * Copyright (c) 2005 Scott Long
-+ * All rights reserved.
-+ *
-+ * Redistribution and use in source and binary forms, with or without
-+ * modification, are permitted provided that the following conditions
-+ * are met:
-+ * 1. Redistributions of source code must retain the above copyright
-+ *    notice, this list of conditions and the following disclaimer.
-+ * 2. Redistributions in binary form must reproduce the above copyright
-+ *    notice, this list of conditions and the following disclaimer in the
-+ *    documentation and/or other materials provided with the distribution.
-+ *
-+ * THIS SOFTWARE IS PROVIDED BY THE NETBSD FOUNDATION, INC. AND CONTRIBUTORS
-+ * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
-+ * TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
-+ * PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE FOUNDATION OR CONTRIBUTORS
-+ * BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
-+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
-+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
-+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
-+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
-+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
-+ * POSSIBILITY OF SUCH DAMAGE.
-+ */
-+
- /* $FreeBSD$ */
- 
--#ifndef _MACHINE_BUS_DMA_H_
--#define	_MACHINE_BUS_DMA_H_
-+#ifndef _ARM64_BUS_DMA_H_
-+#define _ARM64_BUS_DMA_H_
- 
- #include <sys/bus_dma.h>
- 
--#endif /* !_MACHINE_BUS_DMA_H_ */
-+#endif /* _ARM64_BUS_DMA_H_ */
-Index: sys/arm64/include/bus_dma_impl.h
-===================================================================
---- sys/arm64/include/bus_dma_impl.h	(revision 0)
-+++ sys/arm64/include/bus_dma_impl.h	(working copy)
-@@ -0,0 +1,96 @@
-+/*-
-+ * Copyright (c) 2013 The FreeBSD Foundation
-+ * All rights reserved.
-+ *
-+ * This software was developed by Konstantin Belousov <kib@FreeBSD.org>
-+ * under sponsorship from the FreeBSD Foundation.
-+ *
-+ * Redistribution and use in source and binary forms, with or without
-+ * modification, are permitted provided that the following conditions
-+ * are met:
-+ * 1. Redistributions of source code must retain the above copyright
-+ *    notice, this list of conditions and the following disclaimer.
-+ * 2. Redistributions in binary form must reproduce the above copyright
-+ *    notice, this list of conditions and the following disclaimer in the
-+ *    documentation and/or other materials provided with the distribution.
-+ *
-+ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
-+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
-+ * ARE DISCLAIMED. IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
-+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
-+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
-+ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
-+ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
-+ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
-+ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
-+ * SUCH DAMAGE.
-+ *
-+ * $FreeBSD$
-+ */
-+
-+#ifndef	__ARM64_BUS_DMA_IMPL_H
-+#define	__ARM64_BUS_DMA_IMPL_H
-+
-+struct bus_dma_tag_common {
-+	struct bus_dma_impl *impl;
-+	struct bus_dma_tag_common *parent;
-+	bus_size_t	  alignment;
-+	bus_addr_t	  boundary;
-+	bus_addr_t	  lowaddr;
-+	bus_addr_t	  highaddr;
-+	bus_dma_filter_t *filter;
-+	void		 *filterarg;
-+	bus_size_t	  maxsize;
-+	u_int		  nsegments;
-+	bus_size_t	  maxsegsz;
-+	int		  flags;
-+	bus_dma_lock_t	 *lockfunc;
-+	void		 *lockfuncarg;
-+	int		  ref_count;
-+};
-+
-+struct bus_dma_impl {
-+	int (*tag_create)(bus_dma_tag_t parent,
-+	    bus_size_t alignment, bus_addr_t boundary, bus_addr_t lowaddr,
-+	    bus_addr_t highaddr, bus_dma_filter_t *filter,
-+	    void *filterarg, bus_size_t maxsize, int nsegments,
-+	    bus_size_t maxsegsz, int flags, bus_dma_lock_t *lockfunc,
-+	    void *lockfuncarg, bus_dma_tag_t *dmat);
-+	int (*tag_destroy)(bus_dma_tag_t dmat);
-+	int (*map_create)(bus_dma_tag_t dmat, int flags, bus_dmamap_t *mapp);
-+	int (*map_destroy)(bus_dma_tag_t dmat, bus_dmamap_t map);
-+	int (*mem_alloc)(bus_dma_tag_t dmat, void** vaddr, int flags,
-+	    bus_dmamap_t *mapp);
-+	void (*mem_free)(bus_dma_tag_t dmat, void *vaddr, bus_dmamap_t map);
-+	int (*load_ma)(bus_dma_tag_t dmat, bus_dmamap_t map,
-+	    struct vm_page **ma, bus_size_t tlen, int ma_offs, int flags,
-+	    bus_dma_segment_t *segs, int *segp);
-+	int (*load_phys)(bus_dma_tag_t dmat, bus_dmamap_t map,
-+	    vm_paddr_t buf, bus_size_t buflen, int flags,
-+	    bus_dma_segment_t *segs, int *segp);
-+	int (*load_buffer)(bus_dma_tag_t dmat, bus_dmamap_t map,
-+	    void *buf, bus_size_t buflen, pmap_t pmap, int flags,
-+	    bus_dma_segment_t *segs, int *segp);
-+	void (*map_waitok)(bus_dma_tag_t dmat, bus_dmamap_t map,
-+	    struct memdesc *mem, bus_dmamap_callback_t *callback,
-+	    void *callback_arg);
-+	bus_dma_segment_t *(*map_complete)(bus_dma_tag_t dmat, bus_dmamap_t map,
-+	    bus_dma_segment_t *segs, int nsegs, int error);
-+	void (*map_unload)(bus_dma_tag_t dmat, bus_dmamap_t map);
-+	void (*map_sync)(bus_dma_tag_t dmat, bus_dmamap_t map,
-+	    bus_dmasync_op_t op);
-+};
-+
-+void bus_dma_dflt_lock(void *arg, bus_dma_lock_op_t op);
-+int bus_dma_run_filter(struct bus_dma_tag_common *dmat, bus_addr_t paddr);
-+int common_bus_dma_tag_create(struct bus_dma_tag_common *parent,
-+    bus_size_t alignment,
-+    bus_addr_t boundary, bus_addr_t lowaddr, bus_addr_t highaddr,
-+    bus_dma_filter_t *filter, void *filterarg, bus_size_t maxsize,
-+    int nsegments, bus_size_t maxsegsz, int flags, bus_dma_lock_t *lockfunc,
-+    void *lockfuncarg, size_t sz, void **dmat);
-+
-+extern struct bus_dma_impl bus_dma_bounce_impl;
-+
-+#endif
-
-Property changes on: sys/arm64/include/bus_dma_impl.h
-___________________________________________________________________
-Added: svn:mime-type
-## -0,0 +1 ##
-+text/plain
-\ No newline at end of property
-Added: svn:keywords
-## -0,0 +1 ##
-+FreeBSD=%H
-\ No newline at end of property
-Added: svn:eol-style
-## -0,0 +1 ##
-+native
-\ No newline at end of property
 Index: sys/arm64/include/fdt.h
 ===================================================================
 --- sys/arm64/include/fdt.h	(revision 0)
@@ -1816,17 +189,9 @@ Added: svn:eol-style
 \ No newline at end of property
 Index: sys/conf/files.arm64
 ===================================================================
---- sys/conf/files.arm64	(revision 282200)
+--- sys/conf/files.arm64	(revision 282765)
 +++ sys/conf/files.arm64	(working copy)
-@@ -5,6 +5,7 @@
- arm64/arm64/bcopy.c		standard
- arm64/arm64/bus_machdep.c	standard
- arm64/arm64/bus_space_asm.S	standard
-+arm64/arm64/busdma_bounce.c	standard
- arm64/arm64/busdma_machdep.c	standard
- arm64/arm64/clock.c		standard
- arm64/arm64/copyinout.S		standard
-@@ -40,6 +41,7 @@
+@@ -41,6 +41,7 @@
  dev/ofw/ofw_cpu.c		optional	fdt
  dev/psci/psci.c			optional	psci
  dev/psci/psci_arm64.S		optional	psci
@@ -1836,7 +201,7 @@ Index: sys/conf/files.arm64
  kern/kern_clocksource.c		standard
 Index: sys/dev/e1000/if_lem.c
 ===================================================================
---- sys/dev/e1000/if_lem.c	(revision 282200)
+--- sys/dev/e1000/if_lem.c	(revision 282765)
 +++ sys/dev/e1000/if_lem.c	(working copy)
 @@ -2260,7 +2260,7 @@
  	adapter->hw.hw_addr = (u8 *)&adapter->osdep.mem_bus_space_handle;
@@ -1851,7 +216,7 @@ Index: sys/dev/pci/pci-host-generic.c
 ===================================================================
 --- sys/dev/pci/pci-host-generic.c	(revision 0)
 +++ sys/dev/pci/pci-host-generic.c	(working copy)
-@@ -0,0 +1,672 @@
+@@ -0,0 +1,689 @@
 +/*-
 + * Copyright (c) 2015 Ruslan Bukin <br@bsdpad.com>
 + * Copyright (c) 2014 The FreeBSD Foundation
@@ -1982,7 +347,6 @@ Index: sys/dev/pci/pci-host-generic.c
 +    u_long count, u_int flags);
 +static int generic_pcie_release_resource(device_t dev, device_t child,
 +    int type, int rid, struct resource *res);
-+static int generic_pcie_identify_pcib(device_t dev);
 +static int generic_pcie_map_msi(device_t pcib, device_t child, int irq,
 +    uint64_t *addr, uint32_t *data);
 +static int generic_pcie_alloc_msix(device_t pcib, device_t child, int *irq);
@@ -2020,10 +384,6 @@ Index: sys/dev/pci/pci-host-generic.c
 +
 +	sc = device_get_softc(dev);
 +	sc->dev = dev;
-+
-+	/* Identify pcib domain */
-+	if (generic_pcie_identify_pcib(dev))
-+		return (ENXIO);
 +
 +	rid = 0;
 +	sc->res = bus_alloc_resource_any(dev, SYS_RES_MEMORY, &rid, RF_ACTIVE);
@@ -2154,7 +514,7 @@ Index: sys/dev/pci/pci-host-generic.c
 +		sc->ranges[tuple].size = fdt_data_get((void *)cell_ptr, 2);
 +		cell_ptr += size_cells; /* move ptr to next tuple*/
 +
-+		if (bootverbose || 1 == 1) {
++		if (bootverbose) {
 +			device_printf(sc->dev,
 +			    "\tPCI addr: 0x%jx, CPU addr: 0x%jx, Size: 0x%jx\n",
 +			    sc->ranges[tuple].pci_base,
@@ -2261,7 +621,7 @@ Index: sys/dev/pci/pci-host-generic.c
 +    uintptr_t *result)
 +{
 +	struct generic_pcie_softc *sc;
-+	int secondary_bus = 0;
++	int secondary_bus;
 +
 +	sc = device_get_softc(dev);
 +
@@ -2290,16 +650,40 @@ Index: sys/dev/pci/pci-host-generic.c
 +	return (ENOENT);
 +}
 +
++static struct rman *
++generic_pcie_rman(struct generic_pcie_softc *sc, int type)
++{
++
++	switch (type) {
++	case SYS_RES_IOPORT:
++		return (&sc->io_rman);
++	case SYS_RES_MEMORY:
++		return (&sc->mem_rman);
++	case SYS_RES_IRQ:
++		return (&sc->irq_rman);
++	default:
++		break;
++	}
++
++	return (NULL);
++}
++
 +static int
 +generic_pcie_release_resource(device_t dev, device_t child, int type,
 +    int rid, struct resource *res)
 +{
++	struct generic_pcie_softc *sc;
++	struct rman *rm;
 +
-+	if (type != SYS_RES_MEMORY)
-+		return (BUS_RELEASE_RESOURCE(device_get_parent(dev), child,
-+		    type, rid, res));
++	sc = device_get_softc(dev);
 +
-+	return (rman_release_resource(res));
++	rm = generic_pcie_rman(sc, type);
++	if (rm != NULL) {
++		KASSERT(rman_is_region_manager(res, rm), ("rman mismatch"));
++		rman_release_resource(res);
++	}
++
++	return (bus_generic_release_resource(dev, child, type, rid, res));
 +}
 +
 +static struct resource *
@@ -2307,25 +691,15 @@ Index: sys/dev/pci/pci-host-generic.c
 +    u_long start, u_long end, u_long count, u_int flags)
 +{
 +	struct generic_pcie_softc *sc;
-+	struct rman *rm = NULL;
 +	struct resource *res;
++	struct rman *rm;
 +
 +	sc = device_get_softc(dev);
 +
-+	switch (type) {
-+	case SYS_RES_IOPORT:
-+		rm = &sc->io_rman;
-+		break;
-+	case SYS_RES_MEMORY:
-+		rm = &sc->mem_rman;
-+		break;
-+	case SYS_RES_IRQ:
-+		rm = &sc->irq_rman;
-+		break;
-+	default:
++	rm = generic_pcie_rman(sc, type);
++	if (rm == NULL)
 +		return (BUS_ALLOC_RESOURCE(device_get_parent(dev), dev,
 +		    type, rid, start, end, count, flags));
-+	};
 +
 +	if (bootverbose) {
 +		device_printf(dev,
@@ -2338,8 +712,6 @@ Index: sys/dev/pci/pci-host-generic.c
 +		goto fail;
 +
 +	rman_set_rid(res, *rid);
-+	rman_set_bustag(res, fdtbus_bs_tag);
-+	rman_set_bushandle(res, start);
 +
 +	if (flags & RF_ACTIVE)
 +		if (bus_activate_resource(child, type, *rid, res)) {
@@ -2360,19 +732,37 @@ Index: sys/dev/pci/pci-host-generic.c
 +}
 +
 +static int
++generic_pcie_adjust_resource(device_t dev, device_t child, int type,
++    struct resource *res, u_long start, u_long end)
++{
++	struct generic_pcie_softc *sc;
++	struct rman *rm;
++
++	sc = device_get_softc(dev);
++
++	rm = generic_pcie_rman(sc, type);
++	if (rm != NULL)
++		return (rman_adjust_resource(res, start, end));
++	return (bus_generic_adjust_resource(dev, child, type, res, start, end));
++}
++
++static int
 +generic_pcie_activate_resource(device_t dev, device_t child, int type, int rid,
 +    struct resource *r)
 +{
 +	struct generic_pcie_softc *sc;
-+	vm_offset_t vaddr;
 +	uint64_t phys_base;
 +	uint64_t pci_base;
++	vm_offset_t vaddr;
 +	uint64_t size;
 +	int found;
 +	int res;
 +	int i;
 +
 +	sc = device_get_softc(dev);
++
++	if ((res = rman_activate_resource(r)) != 0)
++		return (res);
 +
 +	switch(type) {
 +	case SYS_RES_IOPORT:
@@ -2390,22 +780,21 @@ Index: sys/dev/pci/pci-host-generic.c
 +		if (found) {
 +			vaddr = (vm_offset_t)pmap_mapdev(rman_get_start(r) + \
 +					phys_base, rman_get_size(r));
++			rman_set_virtual(r, (void *)vaddr);
++			rman_set_bustag(r, fdtbus_bs_tag);
 +			rman_set_bushandle(r, vaddr);
-+			res = rman_activate_resource(r);
 +		} else {
 +			device_printf(dev, "Failed to activate IOPORT resource\n");
 +			res = 0;
 +		}
 +		break;
 +	case SYS_RES_MEMORY:
-+		res = (BUS_ACTIVATE_RESOURCE(device_get_parent(dev),
-+		    child, type, rid, r));
-+		break;
-+	case SYS_RES_IRQ:
-+		res = 0;
++		vaddr = (vm_offset_t)pmap_mapdev(rman_get_start(r), rman_get_size(r));
++		rman_set_virtual(r, (void *)vaddr);
++		rman_set_bustag(r, fdtbus_bs_tag);
++		rman_set_bushandle(r, vaddr);
 +		break;
 +	default:
-+		res = ENXIO;
 +		break;
 +	}
 +
@@ -2413,33 +802,25 @@ Index: sys/dev/pci/pci-host-generic.c
 +}
 +
 +static int
-+generic_pcie_setup_intr(device_t bus, device_t child, struct resource *ires,
-+	    int flags, driver_filter_t *filt, driver_intr_t *handler,
-+	    void *arg, void **cookiep)
-+{
-+
-+	return (BUS_SETUP_INTR(device_get_parent(bus), bus, ires, flags,
-+	    filt, handler, arg, cookiep));
-+}
-+
-+static int
-+generic_pcie_teardown_intr(device_t dev, device_t child, struct resource *ires,
-+    void *cookie)
-+{
-+
-+	return (BUS_TEARDOWN_INTR(device_get_parent(dev), dev, ires, cookie));
-+}
-+
-+static int
-+generic_pcie_identify_pcib(device_t dev)
++generic_pcie_deactivate_resource(device_t dev, device_t child, int type, int rid,
++    struct resource *r)
 +{
 +	struct generic_pcie_softc *sc;
-+	u_long start;
++	vm_offset_t vaddr;
 +
 +	sc = device_get_softc(dev);
-+	start = bus_get_resource_start(dev, SYS_RES_MEMORY, 0);
 +
-+	return (0);
++	switch(type) {
++	case SYS_RES_IOPORT:
++	case SYS_RES_MEMORY:
++		vaddr = (vm_offset_t)rman_get_virtual(r);
++		pmap_unmapdev(vaddr, rman_get_size(r));
++		break;
++	default:
++		break;
++	}
++
++	return (rman_deactivate_resource(r));
 +}
 +
 +static int
@@ -2498,11 +879,12 @@ Index: sys/dev/pci/pci-host-generic.c
 +	DEVMETHOD(bus_read_ivar,		generic_pcie_read_ivar),
 +	DEVMETHOD(bus_write_ivar,		generic_pcie_write_ivar),
 +	DEVMETHOD(bus_alloc_resource,		generic_pcie_alloc_resource),
++	DEVMETHOD(bus_adjust_resource,		generic_pcie_adjust_resource),
 +	DEVMETHOD(bus_release_resource,		generic_pcie_release_resource),
 +	DEVMETHOD(bus_activate_resource,	generic_pcie_activate_resource),
-+	DEVMETHOD(bus_deactivate_resource,	bus_generic_deactivate_resource),
-+	DEVMETHOD(bus_setup_intr,		generic_pcie_setup_intr),
-+	DEVMETHOD(bus_teardown_intr,		generic_pcie_teardown_intr),
++	DEVMETHOD(bus_deactivate_resource,	generic_pcie_deactivate_resource),
++	DEVMETHOD(bus_setup_intr,		bus_generic_setup_intr),
++	DEVMETHOD(bus_teardown_intr,		bus_generic_teardown_intr),
 +	DEVMETHOD(pcib_map_msi,			generic_pcie_map_msi),
 +	DEVMETHOD(pcib_alloc_msix,		generic_pcie_alloc_msix),
 +	DEVMETHOD(pcib_release_msix,		generic_pcie_release_msix),
@@ -2527,6 +909,10 @@ Index: sys/dev/pci/pci-host-generic.c
 
 Property changes on: sys/dev/pci/pci-host-generic.c
 ___________________________________________________________________
+Added: svn:eol-style
+## -0,0 +1 ##
++native
+\ No newline at end of property
 Added: svn:mime-type
 ## -0,0 +1 ##
 +text/plain
@@ -2535,13 +921,9 @@ Added: svn:keywords
 ## -0,0 +1 ##
 +FreeBSD=%H
 \ No newline at end of property
-Added: svn:eol-style
-## -0,0 +1 ##
-+native
-\ No newline at end of property
 Index: sys/dev/virtio/pci/virtio_pci.c
 ===================================================================
---- sys/dev/virtio/pci/virtio_pci.c	(revision 282200)
+--- sys/dev/virtio/pci/virtio_pci.c	(revision 282765)
 +++ sys/dev/virtio/pci/virtio_pci.c	(working copy)
 @@ -268,7 +268,7 @@
  	pci_enable_busmaster(dev);
